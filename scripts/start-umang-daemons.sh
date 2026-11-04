@@ -4,7 +4,7 @@
 # ============================================================================
 # Starts and manages the two core daemons required by https://liparola.org/umail:
 #   1. umang-otp-bridge (Port 3001) — WhatsApp (wwebjs/AetherWA) + Huawei Router SMS (192.168.9.1)
-#   2. rust-control-plane (Port 3000 + Tailscale Funnel Port 8443) — UMANG Auth, uMail API & Cloudflare Ingress
+#   2. rust-control-plane (Primary Port 8443 for Tailscale Funnel + Secondary Port 3000 if free)
 # ============================================================================
 set -euo pipefail
 
@@ -25,7 +25,7 @@ show_status() {
   echo "=================================================================="
   echo "📊 KA-POSONG & UMANG DAEMON STATUS"
   echo "=================================================================="
-  echo -n "• UMANG OTP Bridge (127.0.0.1:3001):      "
+  echo -n "• UMANG OTP Bridge (127.0.0.1:3001):            "
   if curl -sf http://127.0.0.1:3001/health >/dev/null 2>&1; then
     echo "ONLINE ✅"
     curl -s http://127.0.0.1:3001/health
@@ -34,18 +34,22 @@ show_status() {
     echo "OFFLINE ❌"
   fi
 
-  echo -n "• Rust Control Plane (127.0.0.1:3000):    "
-  if curl -sf http://127.0.0.1:3000/api/health >/dev/null 2>&1; then
-    echo "ONLINE ✅"
+  echo -n "• ka-posong Control Plane (127.0.0.1:8443):     "
+  if curl -sf http://127.0.0.1:8443/api/health | grep -q "ka-posong-rust-control-plane" 2>/dev/null; then
+    echo "ONLINE ✅ (-> https://aurum-thinkpad-t440p.tail8fafd0.ts.net)"
+    curl -s http://127.0.0.1:8443/api/health
+    echo ""
   else
     echo "OFFLINE ❌"
   fi
 
-  echo -n "• Tailscale Funnel Proxy (127.0.0.1:8443): "
-  if curl -sf http://127.0.0.1:8443/api/health >/dev/null 2>&1; then
-    echo "ONLINE ✅ (-> https://aurum-thinkpad-t440p.tail8fafd0.ts.net)"
+  echo -n "• Local Port 3000 Status (127.0.0.1:3000):      "
+  if curl -sf http://127.0.0.1:3000/api/health | grep -q "ka-posong-rust-control-plane" 2>/dev/null; then
+    echo "ONLINE ✅ (ka-posong secondary listener)"
+  elif curl -sf http://127.0.0.1:3000/api/health | grep -q "linka-workspace-otp-server" 2>/dev/null; then
+    echo "ONLINE ℹ️  (Occupied by PM2 linka-workspace-otp-server; ka-posong serving on :8443)"
   else
-    echo "OFFLINE ❌"
+    echo "OFFLINE"
   fi
   echo "=================================================================="
 }
@@ -71,11 +75,11 @@ nohup env \
   node "${ROOT_DIR}/umang-otp-bridge/src/server.js" \
   > "${LOG_DIR}/umang-otp-bridge.log" 2>&1 &
 
-echo "🚀 [2/2] Starting ka-posong Rust Control Plane & UMANG Gateway on ports 3000 & 8443..."
+echo "🚀 [2/2] Starting ka-posong Rust Control Plane & Tailscale Funnel Gateway on port 8443..."
 cd "${ROOT_DIR}/rust-control-plane"
 nohup env \
-  PORT=3000 \
-  FUNNEL_PORT=8443 \
+  PORT=8443 \
+  SECONDARY_PORT=3000 \
   DATABASE_URL="sqlite://${ROOT_DIR}/rust-control-plane/control_plane.db?mode=rwc" \
   UMANG_OTP_BRIDGE_URL="http://127.0.0.1:3001" \
   PRIMARY_MAIL_HOSTNAME="aurum-thinkpad-t440p.tail8fafd0.ts.net" \

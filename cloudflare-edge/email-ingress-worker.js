@@ -28,6 +28,7 @@ async function computeHmacSha256Hex(secret, messageBuffer) {
 export default {
   async email(message, env, ctx) {
     const tunnelUrl =
+      env.TAILSCALE_INGRESS_URL ||
       env.TUNNEL_INGEST_URL ||
       "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email";
     const bridgeSecret = env.BRIDGE_SECRET || "cf-tunnel-secret";

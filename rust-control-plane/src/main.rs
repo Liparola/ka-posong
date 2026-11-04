@@ -26,7 +26,7 @@ use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::RwLock;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     services::{ServeDir, ServeFile},
 };
 
@@ -1398,30 +1398,40 @@ async fn main() {
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
-    let funnel_port: u16 = env::var("FUNNEL_PORT")
+        .unwrap_or(8443);
+    let secondary_port: u16 = env::var("SECONDARY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(8443);
+        .unwrap_or(3000);
 
-    // Also bind Tailscale Funnel ingress port (8443) when running on standard port 3000
-    if port == 3000 && funnel_port != port {
-        let funnel_addr = SocketAddr::from(([0, 0, 0, 0], funnel_port));
-        if let Ok(funnel_listener) = tokio::net::TcpListener::bind(funnel_addr).await {
-            tracing::info!(
-                "🌐 Tailscale Funnel Ingress Listener active on http://{} (-> https://aurum-thinkpad-t440p.tail8fafd0.ts.net)",
-                funnel_addr
-            );
-            let funnel_app = app.clone();
-            tokio::spawn(async move {
-                let _ = axum::serve(funnel_listener, funnel_app).await;
-            });
+    // Optional secondary port (e.g. 3000) if not already occupied by PM2 workspace-otp-server
+    if secondary_port != port {
+        let sec_addr = SocketAddr::from(([0, 0, 0, 0], secondary_port));
+        match tokio::net::TcpListener::bind(sec_addr).await {
+            Ok(sec_listener) => {
+                tracing::info!(
+                    "🔌 Secondary local listener active on http://{}",
+                    sec_addr
+                );
+                let sec_app = app.clone();
+                tokio::spawn(async move {
+                    let _ = axum::serve(sec_listener, sec_app).await;
+                });
+            }
+            Err(e) => {
+                tracing::info!(
+                    "ℹ️ Secondary port {} is already in use ({}); serving cleanly on primary port {}",
+                    secondary_port,
+                    e,
+                    port
+                );
+            }
         }
     }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(
-        "🚀 ka-posong Rust Mail Control Plane & UMANG Gateway listening on http://{}",
+        "🚀 ka-posong Rust Mail Control Plane & Tailscale Funnel Gateway listening on http://{} (-> https://aurum-thinkpad-t440p.tail8fafd0.ts.net)",
         addr
     );
 
