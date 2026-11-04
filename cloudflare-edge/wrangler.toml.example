@@ -1,0 +1,12 @@
+# ============================================================================
+# CLOUDFLARE WRANGLER CONFIGURATION FOR KA-POSONG EMAIL WORKER
+# ============================================================================
+name = "kaposong-email-ingress"
+main = "email-ingress-worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+TUNNEL_INGEST_URL = "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email"
+
+# Set BRIDGE_SECRET securely using:
+# npx wrangler secret put BRIDGE_SECRET

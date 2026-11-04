@@ -1,0 +1,28 @@
+================================================================================
+CLOUDFLARE DNS PROVISIONING BUNDLE FOR FIRST TENANT: liparola.org
+Tailscale Funnel Host: aurum-thinkpad-t440p.tail8fafd0.ts.net (100.83.242.97)
+Firebase Hosting Site: liparola-ls (https://liparola.org & https://liparola.org/umail)
+================================================================================
+
+1. KEEP EXISTING FIREBASE HOSTING RECORDS (DO NOT DELETE):
+   Type: A     | Name: liparola.org | Content: 199.36.158.100          | Proxy: DNS only
+   Type: TXT   | Name: liparola.org | Content: "hosting-site=liparola-ls"
+
+2. ADD CLOUDFLARE EMAIL ROUTING MX RECORDS (Inbound Port 25 Catch-All):
+   Type: MX    | Name: @            | Mail Server: route1.mx.cloudflare.net | Priority: 10
+   Type: MX    | Name: @            | Mail Server: route2.mx.cloudflare.net | Priority: 20
+   Type: MX    | Name: @            | Mail Server: route3.mx.cloudflare.net | Priority: 30
+
+3. ADD SPF, STALWART DKIM & DMARC TXT RECORDS (Anti-Spoofing & Alignment):
+   Type: TXT   | Name: @
+   Content:    "v=spf1 include:_spf.mx.cloudflare.net a:aurum-thinkpad-t440p.tail8fafd0.ts.net ~all"
+
+   Type: TXT   | Name: kaposong._domainkey
+   Content:    "v=DKIM1; k=ed25519; p=hJQosMmIpddr923JaG8n2p3rT7vW9yB2eF5hJ8kL1mN="
+
+   Type: TXT   | Name: _dmarc
+   Content:    "v=DMARC1; p=quarantine; rua=mailto:postmaster@liparola.org"
+
+4. ADD CNAME FOR DIRECT JMAP / WEBMAIL GATEWAY:
+   Type: CNAME | Name: webmail      | Target: aurum-thinkpad-t440p.tail8fafd0.ts.net | Proxy: DNS only
+================================================================================

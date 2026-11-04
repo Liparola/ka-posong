@@ -1,0 +1,114 @@
+# ============================================================================
+# TRAEFIK v3 DYNAMIC ROUTING & TAILSCALE SUBNET MIDDLEWARE
+# ============================================================================
+
+http:
+  middlewares:
+    tailnet-only:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "100.64.0.0/10"
+          - "172.28.0.0/16"
+          - "192.168.0.0/16"
+
+    cors-headers:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - "*"
+        accessControlAllowOriginList:
+          - "https://liparola.org"
+          - "https://www.liparola.org"
+          - "https://liparola-ls.web.app"
+          - "https://liparola-ls.firebaseapp.com"
+          - "https://aurum-thinkpad-t440p.tail8fafd0.ts.net"
+          - "http://localhost:5173"
+          - "http://localhost:3000"
+        accessControlMaxAge: 86400
+        addVaryHeader: true
+
+  routers:
+    # 1. Public Cloudflare Email Worker MIME Tunnel Receiver
+    ingest-email:
+      rule: "PathPrefix(`/ingest-email`) || PathPrefix(`/ingest-mime`)"
+      entryPoints:
+        - web_funnel
+      service: rust-control-plane
+      priority: 100
+
+    # 2. Control Plane API + UMANG Auth + uMail JMAP Client API
+    api-gateway:
+      rule: "PathPrefix(`/api/v1`) || PathPrefix(`/api/auth`) || PathPrefix(`/api/umail`) || PathPrefix(`/api/internal`) || PathPrefix(`/api/health`)"
+      entryPoints:
+        - web_funnel
+      middlewares:
+        - cors-headers
+      service: rust-control-plane
+      priority: 95
+
+    # 3. DevOps & Technical Admin Managerial Dashboard (Tailnet & Localhost Scoped)
+    ops-dashboard:
+      rule: "PathPrefix(`/ops`)"
+      entryPoints:
+        - web_funnel
+      middlewares:
+        - tailnet-only
+      service: rust-control-plane
+      priority: 90
+
+    # 4. uMail Web Client PWA (/umail)
+    umail-pwa:
+      rule: "PathPrefix(`/umail`)"
+      entryPoints:
+        - web_funnel
+      service: rust-control-plane
+      priority: 85
+
+    # 5. Stalwart JMAP & Admin Console
+    stalwart-jmap:
+      rule: "PathPrefix(`/jmap`) || PathPrefix(`/admin`) || PathPrefix(`/.well-known/jmap`)"
+      entryPoints:
+        - web_funnel
+      middlewares:
+        - cors-headers
+      service: stalwart-http
+      priority: 80
+
+    # 6. SnappyMail Multi-Domain Webmail Fallback
+    snappymail-web:
+      rule: "PathPrefix(`/webmail`) || HostRegexp(`^webmail\\..+`)"
+      entryPoints:
+        - web_funnel
+      service: snappymail-http
+      priority: 50
+
+    # 7. Default Root -> uMail / Control Plane Landing
+    default-root:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - web_funnel
+      service: rust-control-plane
+      priority: 10
+
+  services:
+    rust-control-plane:
+      loadBalancer:
+        servers:
+          - url: "http://172.28.0.15:3000"
+
+    stalwart-http:
+      loadBalancer:
+        servers:
+          - url: "http://172.28.0.20:8080"
+
+    snappymail-http:
+      loadBalancer:
+        servers:
+          - url: "http://172.28.0.30:8888"

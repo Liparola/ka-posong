@@ -1,0 +1,100 @@
+# ============================================================================
+# STALWART MAIL SERVER CONFIGURATION (ka-posong Core Engine)
+# Multi-Tenant JMAP, IMAP4, SMTP, CalDAV, CardDAV & DKIM Signing
+# ============================================================================
+
+[server]
+hostname = "%{env:PRIMARY_MAIL_HOSTNAME:mail.liparola.org}%"
+max-connections = 8192
+
+[server.listener."smtp"]
+bind = ["[::]:25"]
+protocol = "smtp"
+
+[server.listener."submission"]
+bind = ["[::]:587"]
+protocol = "smtp"
+tls.implicit = false
+
+[server.listener."imap"]
+bind = ["[::]:143"]
+protocol = "imap"
+
+[server.listener."imaps"]
+bind = ["[::]:993"]
+protocol = "imap"
+tls.implicit = true
+
+[server.listener."http"]
+bind = ["[::]:8080"]
+protocol = "http"
+
+[http]
+url = "https://%{env:PRIMARY_MAIL_HOSTNAME:mail.liparola.org}%"
+use-x-forwarded = true
+cors.allowed-origins = ["*"]
+cors.allowed-headers = ["*"]
+
+# Trust the internal Docker network (172.28.0.0/16) and localhost so that raw
+# MIME messages injected by rust-control-plane preserve original SPF/DKIM/DMARC
+# and Authentication-Results headers from Cloudflare Email Routing.
+[session.connect]
+trusted-networks = ["172.28.0.0/16", "127.0.0.1/32", "::1/128"]
+
+[session.ehlo]
+require = true
+
+[session.rcpt]
+relay = [
+    { if = "is_local_domain('', rcpt_domain)", then = true },
+    { if = "is_authenticated()", then = true },
+    { if = "in_List(remote_ip, '172.28.0.0/16')", then = true },
+    { else = false }
+]
+
+# Outbound Smart Host Relay on Port 587 to bypass residential ISP Port 25 blocks
+[queue.outbound]
+next-hop = [
+    { if = "is_local_domain('', rcpt_domain)", then = "'local'" },
+    { else = "'smarthost'" }
+]
+
+[queue.outbound.route."smarthost"]
+type = "relay"
+address = "%{env:SMTP_RELAY_HOST:smtp-relay.brevo.com}%"
+port = 587
+protocol = "smtp"
+tls.implicit = false
+tls.allow-invalid-certs = false
+auth.username = "%{env:SMTP_RELAY_USER:relay@liparola.org}%"
+auth.secret = "%{env:SMTP_RELAY_PASS:replace_me}%"
+
+[storage]
+data = "rocksdb"
+fts = "rocksdb"
+blob = "rocksdb"
+lookup = "rocksdb"
+directory = "internal"
+
+[store."rocksdb"]
+type = "rocksdb"
+path = "/opt/stalwart-mail/data"
+compression = "lz4"
+
+[directory."internal"]
+type = "internal"
+store = "rocksdb"
+
+[authentication.fallback-admin]
+user = "%{env:STALWART_ADMIN_USER:admin}%"
+secret = "%{env:STALWART_ADMIN_TOKEN:stalwart_super_admin_secret_change_me}%"
+
+[jmap]
+session.get.max-objects = 500
+push.max-connections = 1024
+
+[tracer."stdout"]
+type = "stdout"
+level = "info"
+ansi = false
+enable = true

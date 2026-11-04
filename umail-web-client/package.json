@@ -1,0 +1,24 @@
+{
+  "name": "umail-web-client",
+  "private": true,
+  "version": "1.0.0",
+  "description": "uMail Bespoke Multi-Tenant Web Mail Client PWA (Lit + TypeScript + UMANG Phone-First OTP SSO)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@lit/context": "^1.0.0",
+    "idb": "^8.0.0",
+    "lit": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/dom-view-transitions": "^1.0.4",
+    "@vite-pwa/assets-generator": "^0.2.3",
+    "typescript": "^5.2.2",
+    "vite": "^5.0.8",
+    "vite-plugin-pwa": "^0.17.4"
+  }
+}

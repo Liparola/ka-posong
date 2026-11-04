@@ -1,0 +1,17 @@
+{
+  "name": "umang-otp-bridge",
+  "version": "1.0.0",
+  "description": "UMANG Resilient Multi-Channel OTP Delivery Microservice (Huawei Router SMS + WhatsApp AetherWA) for ka-posong Mail Suite",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node src/server.js",
+    "test": "NODE_ENV=test node src/test-bridge.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^8.0.0"
+  }
+}

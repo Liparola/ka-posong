@@ -1,0 +1,16 @@
+# Target & Build Artifacts
+target/
+**/target/
+**/dist/
+**/node_modules/
+
+# Databases & Runtime Secrets
+*.db
+*.db-shm
+*.db-wal
+.env
+!*.env.example
+
+# Logs & Temp
+*.log
+logs/

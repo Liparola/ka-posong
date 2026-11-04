@@ -1,0 +1,1386 @@
+// ============================================================================
+// KA-POSONG MULTI-TENANT MAIL CONTROL PLANE & UMANG EXTENSION ENGINE (src/main.rs)
+// Liparola Cloud Service & Server Suite (Lesotho)
+// ============================================================================
+
+pub mod arms_webhook;
+pub mod auth;
+pub mod dashboard;
+pub mod smtp_injector;
+pub mod stalwart_api;
+pub mod tiers;
+pub mod umail_api;
+pub mod umang_auth;
+
+use axum::{
+    body::Bytes,
+    extract::{Extension, Path, State},
+    http::{HeaderMap, StatusCode},
+    middleware,
+    response::{Json, Redirect},
+    routing::{get, patch, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
+use tokio::sync::RwLock;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    services::{ServeDir, ServeFile},
+};
+
+use crate::{
+    arms_webhook::dispatch_tenant_event,
+    auth::{compute_hmac_hex, hash_api_key, rbac_middleware, AuthContext, Role},
+    dashboard::render_ops_dashboard,
+    smtp_injector::{inject_smtp_to_stalwart, parse_rfc822_summary},
+    stalwart_api::{HttpStalwartClient, StalwartClient},
+    tiers::BusinessTier,
+    umail_api::{list_umail_messages, patch_umail_message, send_umail_message},
+    umang_auth::{
+        normalize_lesotho_phone, request_otp_handler, verify_otp_handler, CachedOtpEntry,
+    },
+};
+
+pub struct AppState {
+    pub db: SqlitePool,
+    pub master_devops_key: String,
+    pub cloudflare_ingress_secret: String,
+    pub jwt_secret: String,
+    pub stalwart_smtp_addr: String,
+    pub primary_mail_hostname: String,
+    pub umang_otp_bridge_url: String,
+    pub allow_dev_otp_preview: bool,
+    pub stalwart: Arc<dyn StalwartClient>,
+    pub otp_cache: RwLock<HashMap<String, CachedOtpEntry>>,
+}
+
+// ============================================================================
+// REQUEST & RESPONSE PAYLOAD MODELS
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTenantRequest {
+    pub organization_name: String,
+    pub tier: BusinessTier,
+    pub primary_domain: String,
+    pub admin_email_local_part: String,
+    pub admin_phone: Option<String>,
+    pub admin_initial_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTierRequest {
+    pub tier: BusinessTier,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddDomainRequest {
+    pub domain_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMailboxRequest {
+    pub tenant_id: Option<String>,
+    pub email: String,
+    pub phone: Option<String>,
+    pub display_name: String,
+    pub role: Option<String>,
+    pub password_hash_or_plain: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterArmRequest {
+    pub tenant_id: String,
+    pub module_name: String,
+    pub webhook_url: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendTransactionalRequest {
+    pub tenant_id: Option<String>,
+    pub from: String,
+    pub to: String,
+    pub subject: String,
+    pub body_text: String,
+    pub body_html: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DnsProvisioningBundle {
+    pub domain: String,
+    pub umail_client_url: String,
+    pub records: Vec<DnsRecordEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DnsRecordEntry {
+    pub record_type: String,
+    pub host: String,
+    pub value: String,
+    pub purpose: String,
+}
+
+pub fn build_dns_bundle(
+    domain: &str,
+    primary_mail_hostname: &str,
+    dkim_selector: &str,
+    dkim_public_key: &str,
+) -> DnsProvisioningBundle {
+    DnsProvisioningBundle {
+        domain: domain.to_string(),
+        umail_client_url: format!("https://{}/umail", domain),
+        records: vec![
+            DnsRecordEntry {
+                record_type: "MX".into(),
+                host: "@".into(),
+                value: "10 route1.mx.cloudflare.net".into(),
+                purpose: "Cloudflare Email Routing Primary Inbound Catch-All (Port 25 -> HTTPS Tunnel)".into(),
+            },
+            DnsRecordEntry {
+                record_type: "MX".into(),
+                host: "@".into(),
+                value: "20 route2.mx.cloudflare.net".into(),
+                purpose: "Cloudflare Email Routing Secondary MX".into(),
+            },
+            DnsRecordEntry {
+                record_type: "MX".into(),
+                host: "@".into(),
+                value: "30 route3.mx.cloudflare.net".into(),
+                purpose: "Cloudflare Email Routing Tertiary MX".into(),
+            },
+            DnsRecordEntry {
+                record_type: "TXT".into(),
+                host: "@".into(),
+                value: format!(
+                    "v=spf1 include:_spf.mx.cloudflare.net a:{} ~all",
+                    primary_mail_hostname
+                ),
+                purpose: "SPF Sender Authorization (Cloudflare Edge + Tailscale Host)".into(),
+            },
+            DnsRecordEntry {
+                record_type: "TXT".into(),
+                host: format!("{}._domainkey", dkim_selector),
+                value: dkim_public_key.to_string(),
+                purpose: "Stalwart Cryptographic DKIM Public Signing Key".into(),
+            },
+            DnsRecordEntry {
+                record_type: "TXT".into(),
+                host: "_dmarc".into(),
+                value: format!("v=DMARC1; p=quarantine; rua=mailto:postmaster@{}", domain),
+                purpose: "DMARC Anti-Spoofing & Alignment Policy".into(),
+            },
+            DnsRecordEntry {
+                record_type: "CNAME".into(),
+                host: "webmail".into(),
+                value: primary_mail_hostname.to_string(),
+                purpose: "Custom Domain Webmail & JMAP Gateway Endpoint".into(),
+            },
+        ],
+    }
+}
+
+// ============================================================================
+// CORE REST API HANDLERS
+// ============================================================================
+
+/// POST /api/v1/admin/tenants (and POST /api/v1/tenants)
+async fn onboard_tenant_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Json(payload): Json<CreateTenantRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if auth.role != Role::DevOpsMaster {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Only DEVOPS_MASTER can provision new tenants" })),
+        ));
+    }
+
+    let domain = payload.primary_domain.trim().to_lowercase();
+    let slug: String = domain
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let tenant_id = format!("tnt_{}_{}", slug, &uuid::Uuid::new_v4().simple().to_string()[..6]);
+    let raw_api_key = format!("sk_live_{}", uuid::Uuid::new_v4().simple());
+    let api_key_hash = hash_api_key(&raw_api_key);
+    let limits = payload.tier.limits();
+
+    // 1. Provision domain & fetch/generate DKIM in Stalwart
+    let dkim = state
+        .stalwart
+        .provision_domain(
+            &domain,
+            &tenant_id,
+            &payload.organization_name,
+            limits.quota_bytes,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+
+    // 2. Provision initial admin mailbox in Stalwart
+    let admin_email = format!("{}@{}", payload.admin_email_local_part.trim(), domain);
+    let per_mbx_quota = limits.quota_bytes / limits.max_mailboxes.max(1);
+    let _ = state
+        .stalwart
+        .provision_mailbox(
+            &admin_email,
+            &format!("{} Admin", payload.organization_name),
+            &payload.admin_initial_password,
+            per_mbx_quota,
+        )
+        .await;
+
+    let admin_phone = payload
+        .admin_phone
+        .as_deref()
+        .and_then(normalize_lesotho_phone)
+        .unwrap_or_else(|| "+26658000001".to_string());
+
+    // 3. Persist Tenant, Domain, and Admin Mailbox in SQLite
+    sqlx::query(
+        r#"INSERT INTO tenants (id, org_name, tier, api_key_hash, raw_api_key, max_domains, max_mailboxes, storage_quota_bytes, outbound_daily_limit, allow_extending_arms, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')"#,
+    )
+    .bind(&tenant_id)
+    .bind(&payload.organization_name)
+    .bind(payload.tier.as_str())
+    .bind(&api_key_hash)
+    .bind(&raw_api_key)
+    .bind(limits.max_domains)
+    .bind(limits.max_mailboxes)
+    .bind(limits.quota_bytes)
+    .bind(limits.outbound_daily_limit)
+    .bind(if limits.allow_extending_arms { 1 } else { 0 })
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("Failed to persist tenant: {}", e) })),
+        )
+    })?;
+
+    sqlx::query(
+        r#"INSERT INTO domains (domain_name, tenant_id, dkim_selector, dkim_public_key, umail_path, verified_at)
+           VALUES (?, ?, ?, ?, '/umail', datetime('now'))"#,
+    )
+    .bind(&domain)
+    .bind(&tenant_id)
+    .bind(&dkim.selector)
+    .bind(&dkim.public_key_txt)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("Domain already registered: {}", e) })),
+        )
+    })?;
+
+    sqlx::query(
+        r#"INSERT INTO mailboxes (email, tenant_id, domain_name, phone, display_name, role, stalwart_secret, quota_bytes, whatsapp_otp_enabled, status)
+           VALUES (?, ?, ?, ?, ?, 'admin', ?, ?, 1, 'ACTIVE')"#,
+    )
+    .bind(&admin_email)
+    .bind(&tenant_id)
+    .bind(&domain)
+    .bind(&admin_phone)
+    .bind(format!("{} Admin", payload.organization_name))
+    .bind(&payload.admin_initial_password)
+    .bind(per_mbx_quota)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("Mailbox creation failed: {}", e) })),
+        )
+    })?;
+
+    // Seed welcome message in the new admin mailbox
+    let welcome_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let _ = sqlx::query(
+        r#"INSERT INTO mail_messages (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, is_read, is_starred, spf_dmarc_status)
+           VALUES (?, ?, ?, 'inbox', 'Liparola ka-posong Cloud', 'postmaster@liparola.org', ?, ?, ?, ?, 0, 1, 'PASS (DKIM+SPF)')"#,
+    )
+    .bind(&welcome_id)
+    .bind(&tenant_id)
+    .bind(&admin_email)
+    .bind(&admin_email)
+    .bind(format!("Welcome to uMail for {}!", domain))
+    .bind("Your multi-tenant domain and UMANG phone-bound inbox are now active.")
+    .bind(format!(
+        "Khotso!\n\nYour organization ({}) has been provisioned on the Liparola ka-posong Mail Suite under the {} tier.\n\n• Domain: {}\n• uMail Web Client: https://{}/umail\n• Bound UMANG Phone: {}\n• Inbox: {}\n\nRea leboha,\nLiparola Engineering Team",
+        payload.organization_name,
+        payload.tier.as_str(),
+        domain,
+        domain,
+        admin_phone,
+        admin_email
+    ))
+    .execute(&state.db)
+    .await;
+
+    let dns_bundle = build_dns_bundle(
+        &domain,
+        &state.primary_mail_hostname,
+        &dkim.selector,
+        &dkim.public_key_txt,
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "PROVISIONED",
+        "tenant_id": tenant_id,
+        "scoped_api_key_for_extending_arms": raw_api_key,
+        "admin_mailbox": admin_email,
+        "admin_phone": admin_phone,
+        "umail_pwa_url": format!("https://{}/umail", domain),
+        "tier_limits": limits,
+        "dns_plug_and_play": dns_bundle
+    })))
+}
+
+/// GET /api/v1/admin/tenants (and GET /api/v1/tenants)
+async fn list_tenants_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let rows = sqlx::query(
+        r#"SELECT t.id, t.org_name, t.tier, t.raw_api_key, t.max_domains, t.max_mailboxes, t.storage_quota_bytes, t.status, t.created_at,
+                  (SELECT COUNT(*) FROM domains d WHERE d.tenant_id = t.id) AS domain_count,
+                  (SELECT COUNT(*) FROM mailboxes m WHERE m.tenant_id = t.id) AS mailbox_count
+           FROM tenants t ORDER BY t.created_at DESC"#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let mut list = Vec::new();
+    for r in rows {
+        let tid: String = r.get("id");
+        let doms = sqlx::query("SELECT domain_name FROM domains WHERE tenant_id = ?")
+            .bind(&tid)
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.get::<String, _>("domain_name"))
+            .collect::<Vec<_>>();
+
+        list.push(serde_json::json!({
+            "tenant_id": tid,
+            "organization_name": r.get::<String, _>("org_name"),
+            "tier": r.get::<String, _>("tier"),
+            "domains": doms,
+            "domain_count": r.get::<i64, _>("domain_count"),
+            "mailbox_count": r.get::<i64, _>("mailbox_count"),
+            "max_domains": r.get::<i64, _>("max_domains"),
+            "max_mailboxes": r.get::<i64, _>("max_mailboxes"),
+            "storage_quota_bytes": r.get::<i64, _>("storage_quota_bytes"),
+            "api_key": r.get::<String, _>("raw_api_key"),
+            "status": r.get::<String, _>("status"),
+            "created_at": r.get::<String, _>("created_at")
+        }));
+    }
+
+    Ok(Json(serde_json::json!({ "tenants": list })))
+}
+
+/// PATCH /api/v1/admin/tenants/:id/tier
+async fn update_tenant_tier_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(tenant_id): Path<String>,
+    Json(payload): Json<UpdateTierRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if auth.role != Role::DevOpsMaster {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Only DEVOPS_MASTER can override business tiers" })),
+        ));
+    }
+
+    let limits = payload.tier.limits();
+    let res = sqlx::query(
+        r#"UPDATE tenants
+           SET tier = ?, max_domains = ?, max_mailboxes = ?, storage_quota_bytes = ?, outbound_daily_limit = ?, allow_extending_arms = ?
+           WHERE id = ?"#,
+    )
+    .bind(payload.tier.as_str())
+    .bind(limits.max_domains)
+    .bind(limits.max_mailboxes)
+    .bind(limits.quota_bytes)
+    .bind(limits.outbound_daily_limit)
+    .bind(if limits.allow_extending_arms { 1 } else { 0 })
+    .bind(&tenant_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    if res.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Tenant not found" })),
+        ));
+    }
+
+    // Mirror updated quota into Stalwart for all domains owned by tenant
+    let domains = sqlx::query("SELECT domain_name FROM domains WHERE tenant_id = ?")
+        .bind(&tenant_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    for d in domains {
+        let dom: String = d.get("domain_name");
+        let _ = state
+            .stalwart
+            .update_domain_quota(&dom, limits.quota_bytes)
+            .await;
+    }
+
+    dispatch_tenant_event(
+        &state.db,
+        &tenant_id,
+        "tenant.tier_updated",
+        serde_json::json!({
+            "new_tier": payload.tier.as_str(),
+            "limits": limits
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "TIER_UPDATED",
+        "tenant_id": tenant_id,
+        "new_tier": payload.tier.as_str(),
+        "tier_limits": limits
+    })))
+}
+
+/// POST /api/v1/tenants/:id/domains
+async fn add_tenant_domain_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(tenant_id): Path<String>,
+    Json(payload): Json<AddDomainRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match &auth.role {
+        Role::DevOpsMaster => {}
+        Role::TenantAdmin { tenant_id: tid } if tid == &tenant_id => {}
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Insufficient permissions for this tenant" })),
+            ))
+        }
+    }
+
+    let t_row = sqlx::query(
+        r#"SELECT org_name, tier, max_domains, storage_quota_bytes,
+                  (SELECT COUNT(*) FROM domains WHERE tenant_id = tenants.id) AS used_domains
+           FROM tenants WHERE id = ?"#,
+    )
+    .bind(&tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Tenant not found" })),
+        )
+    })?;
+
+    let max_domains: i64 = t_row.get("max_domains");
+    let used_domains: i64 = t_row.get("used_domains");
+    let org_name: String = t_row.get("org_name");
+    let quota_bytes: i64 = t_row.get("storage_quota_bytes");
+    let tier_str: String = t_row.get("tier");
+
+    if used_domains >= max_domains {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Business Tier ({}) domain limit reached ({}/{} domains). Upgrade tier to add more domains.",
+                    tier_str, used_domains, max_domains
+                )
+            })),
+        ));
+    }
+
+    let domain = payload.domain_name.trim().to_lowercase();
+    let dkim = state
+        .stalwart
+        .provision_domain(&domain, &tenant_id, &org_name, quota_bytes)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            )
+        })?;
+
+    sqlx::query(
+        r#"INSERT INTO domains (domain_name, tenant_id, dkim_selector, dkim_public_key, umail_path, verified_at)
+           VALUES (?, ?, ?, ?, '/umail', datetime('now'))"#,
+    )
+    .bind(&domain)
+    .bind(&tenant_id)
+    .bind(&dkim.selector)
+    .bind(&dkim.public_key_txt)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("Domain already exists: {}", e) })),
+        )
+    })?;
+
+    let dns_bundle = build_dns_bundle(
+        &domain,
+        &state.primary_mail_hostname,
+        &dkim.selector,
+        &dkim.public_key_txt,
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "DOMAIN_ADDED",
+        "tenant_id": tenant_id,
+        "domain": domain,
+        "domains_used": used_domains + 1,
+        "domains_limit": max_domains,
+        "dns_plug_and_play": dns_bundle
+    })))
+}
+
+/// POST /api/v1/tenants/:id/mailboxes (and POST /api/v1/mailboxes)
+async fn create_mailbox_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    path_tid: Option<Path<String>>,
+    Json(payload): Json<CreateMailboxRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tenant_id = path_tid
+        .map(|p| p.0)
+        .or_else(|| payload.tenant_id.clone())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Missing tenant_id" })),
+            )
+        })?;
+
+    match &auth.role {
+        Role::DevOpsMaster => {}
+        Role::TenantAdmin { tenant_id: tid } if tid == &tenant_id => {}
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Insufficient permissions for this tenant" })),
+            ))
+        }
+    }
+
+    let t_row = sqlx::query(
+        r#"SELECT tier, max_mailboxes, storage_quota_bytes,
+                  (SELECT COUNT(*) FROM mailboxes WHERE tenant_id = tenants.id) AS used_mailboxes
+           FROM tenants WHERE id = ?"#,
+    )
+    .bind(&tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Tenant not found" })),
+        )
+    })?;
+
+    let max_mailboxes: i64 = t_row.get("max_mailboxes");
+    let used_mailboxes: i64 = t_row.get("used_mailboxes");
+    let quota_bytes: i64 = t_row.get("storage_quota_bytes");
+    let tier_str: String = t_row.get("tier");
+
+    if used_mailboxes >= max_mailboxes {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Business Tier ({}) mailbox limit reached ({}/{} mailboxes). Upgrade tier to provision more.",
+                    tier_str, used_mailboxes, max_mailboxes
+                )
+            })),
+        ));
+    }
+
+    let email = payload.email.trim().to_lowercase();
+    let domain = email.split('@').nth(1).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid email format" })),
+        )
+    })?;
+
+    let dom_exists = sqlx::query(
+        "SELECT domain_name FROM domains WHERE domain_name = ? AND tenant_id = ?",
+    )
+    .bind(domain)
+    .bind(&tenant_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+
+    if dom_exists.is_none() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Domain is not registered to this tenant" })),
+        ));
+    }
+
+    let phone = payload
+        .phone
+        .as_deref()
+        .and_then(normalize_lesotho_phone)
+        .unwrap_or_else(|| "+26658000099".to_string());
+
+    let per_mbx_quota = quota_bytes / max_mailboxes.max(1);
+    let _ = state
+        .stalwart
+        .provision_mailbox(
+            &email,
+            &payload.display_name,
+            &payload.password_hash_or_plain,
+            per_mbx_quota,
+        )
+        .await;
+
+    let role = payload.role.unwrap_or_else(|| "user".to_string());
+
+    sqlx::query(
+        r#"INSERT INTO mailboxes (email, tenant_id, domain_name, phone, display_name, role, stalwart_secret, quota_bytes, whatsapp_otp_enabled, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'ACTIVE')"#,
+    )
+    .bind(&email)
+    .bind(&tenant_id)
+    .bind(domain)
+    .bind(&phone)
+    .bind(&payload.display_name)
+    .bind(&role)
+    .bind(&payload.password_hash_or_plain)
+    .bind(per_mbx_quota)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("Mailbox already exists: {}", e) })),
+        )
+    })?;
+
+    // Welcome email for the new mailbox
+    let welcome_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let _ = sqlx::query(
+        r#"INSERT INTO mail_messages (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, is_read, is_starred, spf_dmarc_status)
+           VALUES (?, ?, ?, 'inbox', 'uMail Identity Service', 'umang@liparola.org', ?, 'Your UMANG Phone-Bound Inbox is Ready', 'Sign in anytime using your Lesotho phone number and instant OTP.', ?, 0, 0, 'PASS')"#,
+    )
+    .bind(&welcome_id)
+    .bind(&tenant_id)
+    .bind(&email)
+    .bind(&email)
+    .bind(format!(
+        "Hello {},\n\nYour mailbox ({}) is now bound to your UMANG phone identity ({}).\nAccess your inbox at https://{}/umail.",
+        payload.display_name, email, phone, domain
+    ))
+    .execute(&state.db)
+    .await;
+
+    dispatch_tenant_event(
+        &state.db,
+        &tenant_id,
+        "mailbox.created",
+        serde_json::json!({
+            "email": email,
+            "phone": phone,
+            "display_name": payload.display_name
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "MAILBOX_CREATED",
+        "email": email,
+        "phone": phone,
+        "mailboxes_used": used_mailboxes + 1,
+        "mailboxes_limit": max_mailboxes
+    })))
+}
+
+/// POST /api/v1/arms/register
+async fn register_arm_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Json(payload): Json<RegisterArmRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match &auth.role {
+        Role::DevOpsMaster => {}
+        Role::TenantAdmin { tenant_id } if tenant_id == &payload.tenant_id => {}
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Unauthorized to register Extending Arm for this tenant" })),
+            ))
+        }
+    }
+
+    // Verify tenant tier permits Extending Arms
+    let t_row = sqlx::query("SELECT tier, allow_extending_arms FROM tenants WHERE id = ?")
+        .bind(&payload.tenant_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Tenant not found" })),
+            )
+        })?;
+
+    let allow: i64 = t_row.get("allow_extending_arms");
+    let tier_str: String = t_row.get("tier");
+    if allow == 0 {
+        return Err((
+            StatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({
+                "error": format!("Tenant tier ({}) does not permit Extending Arm modules. Upgrade to GROWTH or ENTERPRISE.", tier_str)
+            })),
+        ));
+    }
+
+    let module_id = format!("arm_{}", uuid::Uuid::new_v4().simple());
+    let hmac_secret = format!("whsec_{}", uuid::Uuid::new_v4().simple());
+    let raw_api_key = format!("arm_key_{}", uuid::Uuid::new_v4().simple());
+    let api_key_hash = hash_api_key(&raw_api_key);
+    let scopes_csv = payload.scopes.join(",");
+
+    sqlx::query(
+        r#"INSERT INTO extending_arms (module_id, tenant_id, module_name, webhook_url, hmac_secret, api_key_hash, raw_api_key, scopes, enabled)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)"#,
+    )
+    .bind(&module_id)
+    .bind(&payload.tenant_id)
+    .bind(&payload.module_name)
+    .bind(&payload.webhook_url)
+    .bind(&hmac_secret)
+    .bind(&api_key_hash)
+    .bind(&raw_api_key)
+    .bind(&scopes_csv)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ARM_REGISTERED",
+        "module_id": module_id,
+        "tenant_id": payload.tenant_id,
+        "module_name": payload.module_name,
+        "arm_api_key": raw_api_key,
+        "webhook_hmac_secret": hmac_secret,
+        "scopes": payload.scopes
+    })))
+}
+
+/// POST /api/v1/admin/arms/:id/toggle
+async fn toggle_arm_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(module_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if auth.role != Role::DevOpsMaster {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Only DEVOPS_MASTER can toggle arm modules" })),
+        ));
+    }
+
+    sqlx::query("UPDATE extending_arms SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END WHERE module_id = ?")
+        .bind(&module_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "TOGGLED",
+        "module_id": module_id
+    })))
+}
+
+/// POST /api/v1/arms/send-transactional
+async fn send_transactional_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Json(payload): Json<SendTransactionalRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tenant_id = match &auth.role {
+        Role::DevOpsMaster => payload
+            .tenant_id
+            .clone()
+            .unwrap_or_else(|| "tnt_liparola_org".to_string()),
+        Role::TenantAdmin { tenant_id } => tenant_id.clone(),
+        Role::ExtendingArm {
+            tenant_id, scopes, ..
+        } => {
+            if !scopes.iter().any(|s| s == "mail:send" || s == "*") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({ "error": "Extending Arm lacks 'mail:send' scope" })),
+                ));
+            }
+            tenant_id.clone()
+        }
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Unauthorized role for transactional dispatch" })),
+            ))
+        }
+    };
+
+    let msg_id = format!("tx_{}", uuid::Uuid::new_v4().simple());
+    let raw_mime = format!(
+        "From: <{}>\r\nTo: <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@kaposong.local>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
+        payload.from,
+        payload.to,
+        payload.subject,
+        chrono::Utc::now().to_rfc2822(),
+        msg_id,
+        payload.body_text
+    );
+
+    let relayed = inject_smtp_to_stalwart(
+        &state.stalwart_smtp_addr,
+        &payload.from,
+        &payload.to,
+        raw_mime.as_bytes(),
+    )
+    .await
+    .unwrap_or(false);
+
+    // If recipient is a local mailbox, also store in their inbox
+    let preview: String = payload.body_text.chars().take(120).collect();
+    let _ = sqlx::query(
+        r#"INSERT INTO mail_messages (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status)
+           VALUES (?, ?, ?, 'inbox', 'Transactional Arm', ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Extending Arm)')"#,
+    )
+    .bind(&msg_id)
+    .bind(&tenant_id)
+    .bind(payload.to.trim().to_lowercase())
+    .bind(&payload.from)
+    .bind(payload.to.trim().to_lowercase())
+    .bind(&payload.subject)
+    .bind(&preview)
+    .bind(&payload.body_text)
+    .bind(&payload.body_html)
+    .bind(&raw_mime)
+    .execute(&state.db)
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "TRANSACTIONAL_DISPATCHED",
+        "message_id": msg_id,
+        "tenant_id": tenant_id,
+        "stalwart_relayed": relayed
+    })))
+}
+
+/// POST /ingest-email (and POST /ingest-mime)
+/// Public Tailscale Funnel webhook receiver from Cloudflare Email Workers
+async fn ingest_tunneled_mime_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bridge_secret = headers
+        .get("X-Bridge-Secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let hmac_sig = headers
+        .get("X-Ingress-HMAC-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let expected_hmac = compute_hmac_hex(&state.cloudflare_ingress_secret, &body);
+    let secret_valid = bridge_secret == state.cloudflare_ingress_secret;
+    let hmac_valid = !hmac_sig.is_empty() && hmac_sig.eq_ignore_ascii_case(&expected_hmac);
+
+    if !secret_valid && !hmac_valid {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Invalid X-Bridge-Secret or X-Ingress-HMAC-Signature" })),
+        ));
+    }
+
+    let env_from = headers
+        .get("X-Envelope-From")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Missing X-Envelope-From header" })),
+            )
+        })?;
+
+    let env_to = headers
+        .get("X-Envelope-To")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Missing X-Envelope-To header" })),
+            )
+        })?
+        .trim()
+        .to_lowercase();
+
+    let rcpt_domain = env_to.split('@').nth(1).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid X-Envelope-To address" })),
+        )
+    })?;
+
+    // Check that recipient domain belongs to an ACTIVE tenant
+    let dom_row = sqlx::query(
+        r#"SELECT d.tenant_id, t.status
+           FROM domains d
+           JOIN tenants t ON t.id = d.tenant_id
+           WHERE d.domain_name = ?"#,
+    )
+    .bind(rcpt_domain)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("Recipient domain '{}' is not registered on ka-posong", rcpt_domain)
+            })),
+        )
+    })?;
+
+    let tenant_id: String = dom_row.get("tenant_id");
+    let tenant_status: String = dom_row.get("status");
+    if tenant_status != "ACTIVE" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Target tenant is suspended" })),
+        ));
+    }
+
+    // 1. Parse RFC822 MIME summary and persist in SQLite inbox index for instant uMail PWA access
+    let parsed = parse_rfc822_summary(&body, env_from);
+    let msg_id = format!("ing_{}", uuid::Uuid::new_v4().simple());
+    let preview: String = parsed.body_text.chars().take(120).collect();
+    let raw_str = String::from_utf8_lossy(&body).to_string();
+
+    sqlx::query(
+        r#"INSERT INTO mail_messages
+           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, raw_mime, is_read, spf_dmarc_status)
+           VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
+    )
+    .bind(&msg_id)
+    .bind(&tenant_id)
+    .bind(&env_to)
+    .bind(&parsed.from_header)
+    .bind(env_from)
+    .bind(&env_to)
+    .bind(&parsed.subject)
+    .bind(&preview)
+    .bind(&parsed.body_text)
+    .bind(&raw_str)
+    .bind(&parsed.spf_dmarc_status)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    // 2. Inject raw MIME stream into Stalwart SMTP Port 25
+    let stalwart_injected =
+        inject_smtp_to_stalwart(&state.stalwart_smtp_addr, env_from, &env_to, &body)
+            .await
+            .unwrap_or(false);
+
+    // 3. Fire Extending Arm webhooks if tenant tier permits
+    dispatch_tenant_event(
+        &state.db,
+        &tenant_id,
+        "mail.inbound_ingested",
+        serde_json::json!({
+            "message_id": msg_id,
+            "envelope_from": env_from,
+            "envelope_to": env_to,
+            "subject": parsed.subject,
+            "spf_dmarc_status": parsed.spf_dmarc_status,
+            "stalwart_injected": stalwart_injected
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "INGESTED",
+        "message_id": msg_id,
+        "tenant_id": tenant_id,
+        "recipient": env_to,
+        "spf_dmarc_status": parsed.spf_dmarc_status,
+        "stalwart_smtp_injected": stalwart_injected
+    })))
+}
+
+/// GET /api/health
+async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let t_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+    let m_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailboxes")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "ka-posong-rust-control-plane",
+        "primary_mail_hostname": state.primary_mail_hostname,
+        "tenants_count": t_count,
+        "mailboxes_count": m_count,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+// ============================================================================
+// DATABASE INITIALIZATION & FIRST TENANT SEEDING (liparola.org)
+// ============================================================================
+
+async fn initialize_database_and_seed_liparola(
+    pool: &SqlitePool,
+    primary_mail_hostname: &str,
+) -> Result<(), String> {
+    let schema_sql = include_str!("../migrations/001_init_tenants_and_arms.sql");
+    for statement in schema_sql.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            sqlx::query(trimmed)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Migration error: {}", e))?;
+        }
+    }
+
+    // Ensure first flagship tenant `liparola.org` is provisioned out-of-the-box
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT domain_name FROM domains WHERE domain_name = 'liparola.org'")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    if exists.is_none() {
+        tracing::info!("🌱 Seeding flagship first tenant: liparola.org (Liparola Technologies)");
+        let tenant_id = "tnt_liparola_org";
+        let raw_key = "sk_live_liparola_flagship_tenant_key";
+        let key_hash = hash_api_key(raw_key);
+        let limits = BusinessTier::Enterprise.limits();
+        let dkim_pub = HttpStalwartClient::generate_deterministic_dkim("liparola.org", "kaposong");
+
+        sqlx::query(
+            r#"INSERT INTO tenants (id, org_name, tier, api_key_hash, raw_api_key, max_domains, max_mailboxes, storage_quota_bytes, outbound_daily_limit, allow_extending_arms, status)
+               VALUES (?, 'Liparola Technologies (Flagship)', 'ENTERPRISE', ?, ?, ?, ?, ?, ?, 1, 'ACTIVE')"#,
+        )
+        .bind(tenant_id)
+        .bind(&key_hash)
+        .bind(raw_key)
+        .bind(limits.max_domains)
+        .bind(limits.max_mailboxes)
+        .bind(limits.quota_bytes)
+        .bind(limits.outbound_daily_limit)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        sqlx::query(
+            r#"INSERT INTO domains (domain_name, tenant_id, dkim_selector, dkim_public_key, umail_path, verified_at)
+               VALUES ('liparola.org', ?, 'kaposong', ?, '/umail', datetime('now'))"#,
+        )
+        .bind(tenant_id)
+        .bind(&dkim_pub)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Seed flagship UMANG phone-bound mailboxes for liparola.org
+        let seed_mailboxes = vec![
+            (
+                "admin@liparola.org",
+                "+26657284264",
+                "Liparola Principal Admin",
+                "admin",
+            ),
+            (
+                "khahliso@liparola.org",
+                "+26657893042",
+                "Khahliso Ramotoai",
+                "admin",
+            ),
+            (
+                "info@liparola.org",
+                "+26658088117",
+                "Liparola Info Desk",
+                "user",
+            ),
+        ];
+
+        for (email, phone, name, role) in seed_mailboxes {
+            sqlx::query(
+                r#"INSERT INTO mailboxes (email, tenant_id, domain_name, phone, display_name, role, stalwart_secret, quota_bytes, whatsapp_otp_enabled, status)
+                   VALUES (?, ?, 'liparola.org', ?, ?, ?, 'umang_liparola_secret', 10737418240, 1, 'ACTIVE')"#,
+            )
+            .bind(email)
+            .bind(tenant_id)
+            .bind(phone)
+            .bind(name)
+            .bind(role)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let msg1 = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            sqlx::query(
+                r#"INSERT INTO mail_messages (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, is_read, is_starred, spf_dmarc_status)
+                   VALUES (?, ?, ?, 'inbox', 'ka-posong Control Plane', 'system@liparola.org', ?, 'Welcome to liparola.org uMail — UMANG Instant Inbox', 'Your phone number is now bound to your liparola.org mailbox via UMANG SSO.', ?, 0, 1, 'PASS (DKIM+SPF)')"#,
+            )
+            .bind(&msg1)
+            .bind(tenant_id)
+            .bind(email)
+            .bind(email)
+            .bind(format!(
+                "Khotso {},\n\nWelcome to uMail on liparola.org — powered by the ka-posong Multi-Tenant Mail Suite and Stalwart Engine.\n\n• Mailbox: {}\n• Bound UMANG Phone: {}\n• Tailscale Funnel Host: {}\n• Web Client Route: https://liparola.org/umail\n\nAll inbound emails routed via Cloudflare Email Routing and outbound emails via Smart Host Port 587 are cryptographically verified with DKIM selector 'kaposong._domainkey.liparola.org'.",
+                name, email, phone, primary_mail_hostname
+            ))
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        // Seed default WhatsApp & CRM Extending Arm for liparola.org
+        let arm_key = "arm_key_liparola_whatsapp_notifier";
+        sqlx::query(
+            r#"INSERT INTO extending_arms (module_id, tenant_id, module_name, webhook_url, hmac_secret, api_key_hash, raw_api_key, scopes, enabled)
+               VALUES ('arm_liparola_wa', ?, 'whatsapp_notifier', 'http://127.0.0.1:3001/api/webhook-notify', 'whsec_liparola_wa_2026', ?, ?, 'mail:send,mailbox:read,events:subscribe', 1)"#,
+        )
+        .bind(tenant_id)
+        .bind(hash_api_key(arm_key))
+        .bind(arm_key)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// MAIN ENTRYPOINT
+// ============================================================================
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,rust_control_plane=debug".into()),
+        )
+        .init();
+
+    let db_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://./control_plane.db?mode=rwc".to_string());
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(10)
+        .connect(&db_url)
+        .await
+        .expect("Failed to connect to SQLite database");
+
+    let primary_mail_hostname = env::var("PRIMARY_MAIL_HOSTNAME")
+        .unwrap_or_else(|_| "aurum-thinkpad-t440p.tail8fafd0.ts.net".to_string());
+
+    initialize_database_and_seed_liparola(&pool, &primary_mail_hostname)
+        .await
+        .expect("Failed to initialize database schema");
+
+    let stalwart_api_url =
+        env::var("STALWART_API_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let stalwart_admin_user =
+        env::var("STALWART_ADMIN_USER").unwrap_or_else(|_| "admin".to_string());
+    let stalwart_admin_token = env::var("STALWART_ADMIN_TOKEN")
+        .unwrap_or_else(|_| "stalwart_super_admin_secret_change_me".to_string());
+
+    let stalwart_client = Arc::new(HttpStalwartClient::new(
+        stalwart_api_url,
+        stalwart_admin_user,
+        stalwart_admin_token,
+    ));
+
+    let state = Arc::new(AppState {
+        db: pool,
+        master_devops_key: env::var("MASTER_DEVOPS_KEY")
+            .unwrap_or_else(|_| "devops-master-key".to_string()),
+        cloudflare_ingress_secret: env::var("BRIDGE_SECRET")
+            .unwrap_or_else(|_| "cf-tunnel-secret".to_string()),
+        jwt_secret: env::var("JWT_SECRET")
+            .unwrap_or_else(|_| "umang_sso_jwt_signing_secret_liparola_2026_change_me".to_string()),
+        stalwart_smtp_addr: env::var("STALWART_SMTP_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:2525".to_string()),
+        primary_mail_hostname,
+        umang_otp_bridge_url: env::var("UMANG_OTP_BRIDGE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3001".to_string()),
+        allow_dev_otp_preview: env::var("ALLOW_DEV_OTP_PREVIEW")
+            .map(|v| v != "false")
+            .unwrap_or(true),
+        stalwart: stalwart_client,
+        otp_cache: RwLock::new(HashMap::new()),
+    });
+
+    // Protected Control Plane & Extending-Arm REST API
+    let protected_api = Router::new()
+        .route(
+            "/api/v1/admin/tenants",
+            post(onboard_tenant_handler).get(list_tenants_handler),
+        )
+        .route(
+            "/api/v1/tenants",
+            post(onboard_tenant_handler).get(list_tenants_handler),
+        )
+        .route(
+            "/api/v1/admin/tenants/:id/tier",
+            patch(update_tenant_tier_handler),
+        )
+        .route("/api/v1/tenants/:id/domains", post(add_tenant_domain_handler))
+        .route(
+            "/api/v1/tenants/:id/mailboxes",
+            post(create_mailbox_handler),
+        )
+        .route("/api/v1/mailboxes", post(create_mailbox_handler))
+        .route("/api/v1/arms/register", post(register_arm_handler))
+        .route(
+            "/api/v1/admin/arms/:id/toggle",
+            post(toggle_arm_handler),
+        )
+        .route(
+            "/api/v1/arms/send-transactional",
+            post(send_transactional_handler),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            rbac_middleware,
+        ));
+
+    // Public Ingress, UMANG Auth, uMail JMAP Client API & Managerial Dashboard
+    let umail_static_dir = env::var("UMAIL_STATIC_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("../umail-web-client/dist"));
+    let umail_index = umail_static_dir.join("index.html");
+
+    let serve_umail = ServeDir::new(&umail_static_dir)
+        .not_found_service(ServeFile::new(&umail_index));
+
+    let public_routes = Router::new()
+        .route("/", get(|| async { Redirect::temporary("/umail") }))
+        .route("/api/health", get(health_handler))
+        .route("/ingest-email", post(ingest_tunneled_mime_handler))
+        .route("/ingest-mime", post(ingest_tunneled_mime_handler))
+        .route("/api/auth/request-otp", post(request_otp_handler))
+        .route("/api/auth/verify-otp", post(verify_otp_handler))
+        .route("/api/umail/messages", get(list_umail_messages))
+        .route("/api/umail/send", post(send_umail_message))
+        .route("/api/umail/messages/:id", patch(patch_umail_message))
+        .route("/ops", get(render_ops_dashboard))
+        .route("/ops-dashboard", get(render_ops_dashboard))
+        .nest_service("/umail", serve_umail);
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .merge(protected_api)
+        .merge(public_routes)
+        .layer(cors)
+        .with_state(state);
+
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    tracing::info!(
+        "🚀 ka-posong Rust Mail Control Plane & UMANG Gateway listening on http://{}",
+        addr
+    );
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}

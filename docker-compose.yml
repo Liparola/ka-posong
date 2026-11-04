@@ -1,0 +1,140 @@
+version: "3.9"
+
+services:
+  # --------------------------------------------------------------------------
+  # 1. TRAEFIK v3 REVERSE PROXY (Host Port 8443 -> Tailscale Funnel Port 443)
+  # --------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.1
+    container_name: kaposong-traefik
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+      - "8088:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    networks:
+      mail_core_net:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      - rust-control-plane
+      - stalwart
+
+  # --------------------------------------------------------------------------
+  # 2. RUST CONTROL PLANE, TIER ENGINE, JMAP PROXY & UMANG AUTH GATEWAY
+  # --------------------------------------------------------------------------
+  rust-control-plane:
+    build:
+      context: ./rust-control-plane
+      dockerfile: Dockerfile
+    container_name: kaposong-control-plane
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info,rust_control_plane=debug
+      - DATABASE_URL=sqlite:///data/control_plane.db?mode=rwc
+      - STALWART_API_URL=http://172.28.0.20:8080
+      - STALWART_SMTP_ADDR=172.28.0.20:25
+      - UMANG_OTP_BRIDGE_URL=http://172.28.0.40:3001
+      - UMAIL_STATIC_DIR=/app/umail-dist
+    ports:
+      - "3000:3000"
+    volumes:
+      - control-plane-db:/data
+      - ./domains:/app/domains
+      - ./umail-web-client/dist:/app/umail-dist:ro
+    networks:
+      mail_core_net:
+        ipv4_address: 172.28.0.15
+    depends_on:
+      - stalwart
+      - umang-otp-bridge
+
+  # --------------------------------------------------------------------------
+  # 3. STALWART MAIL SERVER (JMAP, IMAP4, SMTP, CalDAV, CardDAV, DKIM Engine)
+  # --------------------------------------------------------------------------
+  stalwart:
+    image: stalwartlabs/mail-server:v0.15.4
+    container_name: kaposong-stalwart
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "2525:25"
+      - "587:587"
+      - "143:143"
+      - "993:993"
+      - "8080:8080"
+    volumes:
+      - stalwart-data:/opt/stalwart-mail
+      - ./stalwart/config.toml:/opt/stalwart-mail/etc/config.toml:ro
+    networks:
+      mail_core_net:
+        ipv4_address: 172.28.0.20
+
+  # --------------------------------------------------------------------------
+  # 4. SNAPPYMAIL MULTI-DOMAIN WEBMAIL (Fallback / Admin IMAP Webmail)
+  # --------------------------------------------------------------------------
+  snappymail:
+    image: djmaze/snappymail:latest
+    container_name: kaposong-snappymail
+    restart: unless-stopped
+    volumes:
+      - snappymail-data:/var/lib/snappymail
+    networks:
+      mail_core_net:
+        ipv4_address: 172.28.0.30
+    depends_on:
+      - stalwart
+
+  # --------------------------------------------------------------------------
+  # 5. UMANG OTP DELIVERY BRIDGE (Huawei Router SMS + WhatsApp AetherWA)
+  # --------------------------------------------------------------------------
+  umang-otp-bridge:
+    build:
+      context: ./umang-otp-bridge
+      dockerfile: Dockerfile
+    container_name: kaposong-umang-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3001:3001"
+    networks:
+      mail_core_net:
+        ipv4_address: 172.28.0.40
+
+  # --------------------------------------------------------------------------
+  # 6. DOCKGE CONTAINER LIFECYCLE MANAGER (Tailscale IP Scoped)
+  # --------------------------------------------------------------------------
+  dockge:
+    image: louislam/dockge:1
+    container_name: kaposong-dockge
+    restart: unless-stopped
+    ports:
+      - "${TAILSCALE_IP:-127.0.0.1}:5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - dockge-data:/app/data
+      - ./:/opt/stacks/ka-posong
+    environment:
+      - DOCKGE_STACKS_DIR=/opt/stacks
+    networks:
+      mail_core_net:
+        ipv4_address: 172.28.0.50
+
+volumes:
+  stalwart-data:
+  control-plane-db:
+  snappymail-data:
+  dockge-data:
+
+networks:
+  mail_core_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

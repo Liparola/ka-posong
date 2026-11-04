@@ -1,0 +1,25 @@
+# ============================================================================
+# TRAEFIK v3 STATIC CONFIGURATION (ka-posong Edge Router)
+# ============================================================================
+
+api:
+  dashboard: true
+  insecure: true
+
+entryPoints:
+  web_funnel:
+    address: ":8443"
+    forwardedHeaders:
+      trustedIPs:
+        - "127.0.0.1/32"
+        - "100.64.0.0/10"
+        - "172.28.0.0/16"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+accessLog: {}
+log:
+  level: INFO
