@@ -1360,21 +1360,65 @@ async fn main() {
         .route("/ops-dashboard", get(render_ops_dashboard))
         .nest_service("/umail", serve_umail);
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = CorsLayer::permissive();
 
     let app = Router::new()
         .merge(protected_api)
         .merge(public_routes)
         .layer(cors)
+        .layer(middleware::from_fn(
+            |req: axum::extract::Request, next: middleware::Next| async move {
+                if req.method() == axum::http::Method::OPTIONS {
+                    let mut resp = axum::response::Response::new(axum::body::Body::empty());
+                    *resp.status_mut() = StatusCode::OK;
+                    let headers = resp.headers_mut();
+                    headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+                    headers.insert(
+                        "Access-Control-Allow-Methods",
+                        "GET, POST, PUT, PATCH, DELETE, OPTIONS".parse().unwrap(),
+                    );
+                    headers.insert(
+                        "Access-Control-Allow-Headers",
+                        "Content-Type, Authorization, X-Internal-Token, X-Bridge-Secret, X-Ingress-HMAC-Signature, Accept"
+                            .parse()
+                            .unwrap(),
+                    );
+                    headers.insert("Access-Control-Allow-Private-Network", "true".parse().unwrap());
+                    return resp;
+                }
+                let mut resp = next.run(req).await;
+                let headers = resp.headers_mut();
+                headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+                headers.insert("Access-Control-Allow-Private-Network", "true".parse().unwrap());
+                resp
+            },
+        ))
         .with_state(state);
 
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
+    let funnel_port: u16 = env::var("FUNNEL_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8443);
+
+    // Also bind Tailscale Funnel ingress port (8443) when running on standard port 3000
+    if port == 3000 && funnel_port != port {
+        let funnel_addr = SocketAddr::from(([0, 0, 0, 0], funnel_port));
+        if let Ok(funnel_listener) = tokio::net::TcpListener::bind(funnel_addr).await {
+            tracing::info!(
+                "🌐 Tailscale Funnel Ingress Listener active on http://{} (-> https://aurum-thinkpad-t440p.tail8fafd0.ts.net)",
+                funnel_addr
+            );
+            let funnel_app = app.clone();
+            tokio::spawn(async move {
+                let _ = axum::serve(funnel_listener, funnel_app).await;
+            });
+        }
+    }
+
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(
         "🚀 ka-posong Rust Mail Control Plane & UMANG Gateway listening on http://{}",

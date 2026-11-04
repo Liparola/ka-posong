@@ -196,7 +196,7 @@ pub async fn request_otp_handler(
     let mut delivery_mode = "umang-console-win-win".to_string();
     if let Ok(resp) = reqwest::Client::new()
         .post(&bridge_url)
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(12))
         .json(&bridge_payload)
         .send()
         .await

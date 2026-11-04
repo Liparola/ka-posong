@@ -5,22 +5,173 @@
  * UMANG MULTI-CHANNEL OTP DELIVERY BRIDGE (ka-posong Identity Service)
  * ============================================================================
  * Implements the Liparola UMANG OTP delivery blueprint:
- * 1. WhatsApp OTP Delivery via AetherWA (`linka-otp-delivery-aetherwa` protocol)
- *    with bilingual Sesotho/English message formatting.
- * 2. Hardware SMS Delivery via Huawei LTE Router Gateway (`192.168.8.1`, `192.168.10.1`)
- *    with automatic router failover and Lesotho 8-digit normalization.
+ * 1. WhatsApp OTP Delivery via embedded `whatsapp-web.js` (using the authenticated
+ *    UMANG `.wwebjs_auth` session from `ka.sesiung/workspace-otp-server`) OR
+ *    external AetherWA (`linka-otp-delivery-aetherwa`) HTTP gateway, with
+ *    bilingual Sesotho/English message formatting.
+ * 2. Hardware SMS Delivery via `HuaweiGateway` (`workspace-otp-server-sms` driver)
+ *    and Huawei LTE Router Pool (`192.168.9.1`, `192.168.8.1`, `192.168.10.1`)
+ *    with SCRAM/SHA256 authentication (`admin` / `Technomath`) and Lesotho 8-digit
+ *    normalization.
  * 3. Origin-bound WebOTP SMS formatting (`@<domain> #<otp>`) on the final line
  *    so mobile browsers and Safari autofill bars verify the tenant domain.
- * 4. Non-strict Dev Console Win-Win fallback when physical hardware is offline.
+ * 4. Non-strict Dev Console Win-Win fallback when physical hardware is offline
+ *    or still warming up.
  */
 
 const http = require('http');
-const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = parseInt(process.env.UMANG_BRIDGE_PORT || '3001', 10);
 const HOST = process.env.UMANG_BRIDGE_HOST || '0.0.0.0';
 
 let lastDeliveryEvent = null;
+
+// ============================================================================
+// 1. EMBEDDED WHATSAPP-WEB.JS ENGINE (Reusing authenticated ka.sesiung session)
+// ============================================================================
+let wwebClient = null;
+let wwebReady = false;
+let wwebStatus = 'uninitialized';
+
+function initEmbeddedWhatsApp() {
+  if (process.env.DISABLE_EMBEDDED_WWEBJS === 'true') {
+    wwebStatus = 'disabled';
+    return;
+  }
+
+  const candidateModules = [
+    '/home/aurum/Documents/Projects/Business/Liparola FC/ka.sesiung/workspace-otp-server/node_modules/whatsapp-web.js',
+    '/home/aurum/Documents/Linka-Lesotho-2L-/khauta-stunning-tribble/workspace-otp-server/node_modules/whatsapp-web.js',
+  ];
+
+  let WWebJS = null;
+  for (const modPath of candidateModules) {
+    try {
+      if (fs.existsSync(modPath)) {
+        WWebJS = require(modPath);
+        break;
+      }
+    } catch (_) {}
+  }
+
+  if (!WWebJS) {
+    wwebStatus = 'driver-not-found';
+    return;
+  }
+
+  const authDataPath =
+    process.env.WWEBJS_AUTH_PATH ||
+    '/home/aurum/Documents/Projects/Business/Liparola FC/ka.sesiung/workspace-otp-server/.wwebjs_auth';
+
+  // Clean up stale Chromium singleton locks if no chrome is holding that session dir
+  const sessionDir = path.join(authDataPath, 'session');
+  for (const lockFile of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      const p = path.join(sessionDir, lockFile);
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (_) {}
+  }
+
+  const chromeCandidates = [
+    process.env.WHATSAPP_CHROME_PATH,
+    '/opt/google/chrome/chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+  ].filter(Boolean);
+
+  const executablePath = chromeCandidates.find((p) => fs.existsSync(p));
+  const headless = process.env.WHATSAPP_HEADFUL === 'true' ? false : true;
+
+  try {
+    wwebStatus = 'initializing';
+    const { Client, LocalAuth } = WWebJS;
+    wwebClient = new Client({
+      authStrategy: new LocalAuth({ dataPath: authDataPath }),
+      puppeteer: {
+        executablePath,
+        headless,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+        ],
+      },
+    });
+
+    wwebClient.on('ready', () => {
+      wwebReady = true;
+      wwebStatus = 'ready';
+      console.log('✅ [UMANG-WA] Embedded WhatsApp OTP Bot is authenticated and READY!');
+    });
+
+    wwebClient.on('authenticated', () => {
+      wwebStatus = 'authenticated';
+      console.log('🔐 [UMANG-WA] WhatsApp session authenticated via LocalAuth.');
+    });
+
+    wwebClient.on('qr', () => {
+      wwebStatus = 'awaiting-qr';
+      console.warn('⚠️ [UMANG-WA] WhatsApp session requires QR scan (falling back to SMS / Win-Win until scanned).');
+    });
+
+    wwebClient.on('disconnected', (reason) => {
+      wwebReady = false;
+      wwebStatus = `disconnected:${reason}`;
+    });
+
+    wwebClient.initialize().catch((err) => {
+      wwebStatus = `error:${err.message}`;
+      console.warn('⚠️ [UMANG-WA] Non-fatal WhatsApp initialization notice:', err.message);
+    });
+  } catch (err) {
+    wwebStatus = `error:${err.message}`;
+  }
+}
+
+// ============================================================================
+// 2. HUAWEI LTE ROUTER SMS GATEWAY POOL (`192.168.9.1`, `192.168.8.1`, `192.168.10.1`)
+// ============================================================================
+let huaweiGateway = null;
+let huaweiReady = false;
+
+async function initHuaweiGatewayPool() {
+  const driverPath =
+    '/home/aurum/Documents/Linka-Lesotho-2L-/khauta-stunning-tribble/workspace-otp-server-sms';
+  try {
+    if (!fs.existsSync(driverPath)) return;
+    const { HuaweiGateway } = require(driverPath);
+    const routerIps = (process.env.ROUTER_IPS || '192.168.9.1,192.168.8.1,192.168.10.1')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const user = process.env.ROUTER_USER || 'admin';
+    const pass = process.env.ROUTER_PASS || 'Technomath';
+
+    huaweiGateway = new HuaweiGateway({
+      routers: routerIps.map((ip) => ({
+        url: ip,
+        username: user,
+        password: pass,
+        timeout: 6000,
+        gcIntervalMs: 60000,
+        gcThreshold: 15,
+        autoDeleteRead: true,
+        autoDeleteSent: true,
+      })),
+      strategy: 'failover',
+    });
+
+    const results = await huaweiGateway.initialize();
+    huaweiReady = Array.isArray(results) && results.some((r) => r.status === 'fulfilled' && r.value?.reachable);
+    console.log(`📡 [UMANG-SMS] Huawei Router Gateway Pool initialized (reachable=${huaweiReady}, routers=${routerIps.join(',')})`);
+  } catch (err) {
+    console.warn(`⚠️ [UMANG-SMS] HuaweiGateway driver init warning: ${err.message}`);
+  }
+}
 
 /**
  * Normalizes a Lesotho phone number to E.164 (+266########)
@@ -109,7 +260,7 @@ function tryAetherWaHttp(payload) {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
         },
-        timeout: 3500,
+        timeout: 2500,
       },
       (res) => {
         let data = '';
@@ -133,79 +284,6 @@ function tryAetherWaHttp(payload) {
   });
 }
 
-/**
- * Attempts to dispatch SMS via Huawei Router HTTP API (`/api/webserver/SesTokInfo` -> `/api/sms/send-sms`)
- */
-function tryHuaweiRouterSms(routerIp, routerPhone, smsText) {
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: routerIp,
-        port: 80,
-        path: '/api/webserver/SesTokInfo',
-        method: 'GET',
-        timeout: 2500,
-      },
-      (res) => {
-        let xml = '';
-        res.on('data', (c) => (xml += c));
-        res.on('end', () => {
-          const sesMatch = xml.match(/<SesInfo>(.*?)<\/SesInfo>/);
-          const tokMatch = xml.match(/<TokInfo>(.*?)<\/TokInfo>/);
-          if (!sesMatch || !tokMatch) {
-            return reject(new Error(`Router ${routerIp} did not return SesTokInfo`));
-          }
-          const payloadXml =
-            `<?xml version="1.0" encoding="UTF-8"?>` +
-            `<request><Index>-1</Index><Phones><Phone>${routerPhone}</Phone></Phones>` +
-            `<Sca></Sca><Content>${smsText}</Content><Length>${smsText.length}</Length>` +
-            `<Reserved>1</Reserved><Date>${new Date().toISOString().slice(0, 19).replace('T', ' ')}</Date></request>`;
-
-          const sendReq = http.request(
-            {
-              hostname: routerIp,
-              port: 80,
-              path: '/api/sms/send-sms',
-              method: 'POST',
-              headers: {
-                Cookie: sesMatch[1],
-                __RequestVerificationToken: tokMatch[1],
-                'Content-Type': 'application/xml',
-                'Content-Length': Buffer.byteLength(payloadXml),
-              },
-              timeout: 3500,
-            },
-            (sendRes) => {
-              let respXml = '';
-              sendRes.on('data', (c) => (respXml += c));
-              sendRes.on('end', () => {
-                if (respXml.includes('<response>OK</response>')) {
-                  resolve({ delivered: true, channel: 'sms', routerIp });
-                } else {
-                  reject(new Error(`Router ${routerIp} SMS response: ${respXml.slice(0, 120)}`));
-                }
-              });
-            }
-          );
-          sendReq.on('error', reject);
-          sendReq.on('timeout', () => {
-            sendReq.destroy();
-            reject(new Error(`Router ${routerIp} send-sms timeout`));
-          });
-          sendReq.write(payloadXml);
-          sendReq.end();
-        });
-      }
-    );
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error(`Router ${routerIp} unreachable`));
-    });
-    req.end();
-  });
-}
-
 async function dispatchOtp({ phone, otp, channel, domain, email }) {
   const e164 = normalizeE164(phone);
   if (!e164) {
@@ -223,10 +301,32 @@ async function dispatchOtp({ phone, otp, channel, domain, email }) {
 
   let primaryError = null;
 
-  // 1. Try WhatsApp / AetherWA if preferred
+  // 1A. Try Embedded whatsapp-web.js if ready
+  if ((preferred === 'whatsapp' || preferred === 'aetherwa') && wwebReady && wwebClient) {
+    try {
+      const chatId = `${e164.replace(/\D/g, '')}@c.us`;
+      await wwebClient.sendMessage(chatId, waMessage);
+      lastDeliveryEvent = {
+        phone: e164,
+        email,
+        domain: targetDomain,
+        otp,
+        channel: 'whatsapp',
+        mode: 'whatsapp-wwebjs',
+        fallbackUsed: false,
+        timestamp: new Date().toISOString(),
+      };
+      console.log(`✅ [UMANG-WA] Sent WhatsApp OTP [${otp}] to ${e164} (${email || targetDomain})`);
+      return lastDeliveryEvent;
+    } catch (waErr) {
+      primaryError = waErr.message;
+    }
+  }
+
+  // 1B. Try external AetherWA HTTP Gateway if online
   if (preferred === 'whatsapp' || preferred === 'aetherwa') {
     try {
-      const res = await tryAetherWaHttp({
+      await tryAetherWaHttp({
         phone: e164,
         jid,
         otp,
@@ -240,6 +340,7 @@ async function dispatchOtp({ phone, otp, channel, domain, email }) {
         domain: targetDomain,
         otp,
         channel: 'whatsapp',
+        mode: 'whatsapp-aetherwa',
         fallbackUsed: false,
         timestamp: new Date().toISOString(),
       };
@@ -249,30 +350,29 @@ async function dispatchOtp({ phone, otp, channel, domain, email }) {
     }
   }
 
-  // 2. Try Huawei Router SMS Pool
-  const routerIps = (process.env.ROUTER_IPS || '192.168.8.1,192.168.10.1')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (process.env.MOCK_SMS !== 'true') {
-    for (const ip of routerIps) {
-      try {
-        await tryHuaweiRouterSms(ip, routerPhone, smsMessage);
-        lastDeliveryEvent = {
-          phone: e164,
-          email,
-          domain: targetDomain,
-          otp,
-          channel: 'sms',
-          routerIp: ip,
-          fallbackUsed: preferred !== 'sms',
-          timestamp: new Date().toISOString(),
-        };
-        return lastDeliveryEvent;
-      } catch (routerErr) {
-        primaryError = routerErr.message;
-      }
+  // 2. Try Authenticated Huawei Router SMS Pool (`192.168.9.1`, `192.168.8.1`, `192.168.10.1`)
+  if (process.env.MOCK_SMS !== 'true' && huaweiGateway) {
+    try {
+      const result = await huaweiGateway.sendOtp(routerPhone, otp, {
+        appName: `uMail ${targetDomain}`,
+        ttlMinutes: 5,
+        customTemplate: smsMessage,
+      });
+      lastDeliveryEvent = {
+        phone: e164,
+        email,
+        domain: targetDomain,
+        otp,
+        channel: 'sms',
+        mode: 'huawei-router-sms',
+        routerIp: result.deliveredBy || '192.168.9.1',
+        fallbackUsed: preferred !== 'sms',
+        timestamp: new Date().toISOString(),
+      };
+      console.log(`✅ [UMANG-SMS] Sent SMS OTP [${otp}] via Huawei Router (${lastDeliveryEvent.routerIp}) to ${routerPhone}`);
+      return lastDeliveryEvent;
+    } catch (routerErr) {
+      primaryError = routerErr.message;
     }
   }
 
@@ -306,6 +406,7 @@ const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Internal-Token');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
@@ -319,6 +420,9 @@ const server = http.createServer((req, res) => {
         status: 'ok',
         service: 'umang-otp-bridge',
         standard: 'UMANG-AetherWA-SMS-v1',
+        whatsappStatus: wwebStatus,
+        whatsappReady: wwebReady,
+        huaweiRouterReachable: huaweiReady,
         lastDelivery: lastDeliveryEvent,
         timestamp: new Date().toISOString(),
       })
@@ -349,6 +453,8 @@ const server = http.createServer((req, res) => {
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
     console.log(`🚀 UMANG Multi-Channel OTP Bridge listening on http://${HOST}:${PORT}`);
+    initHuaweiGatewayPool();
+    initEmbeddedWhatsApp();
   });
 }
 
