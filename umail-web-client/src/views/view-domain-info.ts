@@ -100,7 +100,7 @@ export class ViewDomainInfo extends LitElement {
             <tr>
               <td><strong>TXT</strong></td>
               <td><code>kaposong._domainkey</code></td>
-              <td><code>v=DKIM1; k=ed25519; p=849428b0c988a5d8e...</code></td>
+              <td><code>v=DKIM1; k=ed25519; p=hJQosMmIpddr923JaG8n2p3rT7vW9yB2eF5hJ8kL1mN=</code></td>
               <td>Stalwart Cryptographic DKIM Public Key</td>
             </tr>
             <tr>

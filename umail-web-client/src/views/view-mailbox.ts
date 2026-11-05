@@ -1,15 +1,23 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { mailService, type MailMessage } from '../services/mail';
+import { mailService } from '../services/mail';
 import { authService } from '../services/auth';
+import {
+  normalizeMailMessage,
+  safeSetEmailHTML,
+  type NormalizedMailMessage,
+} from '../utils/mime-renderer';
+
+type RenderMode = 'rich' | 'plain' | 'meta';
 
 @customElement('view-mailbox')
 export class ViewMailbox extends LitElement {
   @property({ type: String }) folder = 'inbox';
-  @state() private messages: MailMessage[] = [];
-  @state() private selectedMessage: MailMessage | null = null;
+  @state() private messages: NormalizedMailMessage[] = [];
+  @state() private selectedMessage: NormalizedMailMessage | null = null;
   @state() private searchQuery = '';
   @state() private loading = true;
+  @state() private renderMode: RenderMode = 'rich';
 
   private _mailUpdateHandler!: () => void;
 
@@ -83,18 +91,25 @@ export class ViewMailbox extends LitElement {
     }
 
     .btn-action {
-      padding: 9px 14px;
+      padding: 8px 13px;
       border-radius: 8px;
       border: 1px solid #d0c4f7;
       background: #fff;
       color: #6200ee;
       font-weight: 600;
-      font-size: 0.85rem;
+      font-size: 0.83rem;
       cursor: pointer;
+      transition: all 0.15s ease;
     }
 
     .btn-action:hover {
       background: #f3ebff;
+    }
+
+    .btn-action.active {
+      background: #6200ee;
+      color: #fff;
+      border-color: #6200ee;
     }
 
     .split-pane {
@@ -120,11 +135,14 @@ export class ViewMailbox extends LitElement {
     }
 
     .msg-row {
+      display: flex;
+      gap: 12px;
       padding: 14px 16px;
       border-bottom: 1px solid #f0f0f5;
       cursor: pointer;
       transition: background 0.15s;
       border-left: 4px solid transparent;
+      align-items: flex-start;
     }
 
     .msg-row:hover {
@@ -141,11 +159,32 @@ export class ViewMailbox extends LitElement {
       border-left-color: #3700b3;
     }
 
+    .avatar-circle {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #6200ee, #9c27b0);
+      color: #fff;
+      font-weight: 700;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .msg-content {
+      flex: 1;
+      min-width: 0;
+    }
+
     .msg-top {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 4px;
+      margin-bottom: 3px;
+      gap: 6px;
     }
 
     .sender {
@@ -158,16 +197,20 @@ export class ViewMailbox extends LitElement {
     }
 
     .date {
-      font-size: 0.74rem;
-      color: #888;
+      font-size: 0.73rem;
+      color: #777;
       white-space: nowrap;
+      flex-shrink: 0;
     }
 
     .subject {
-      font-size: 0.88rem;
+      font-size: 0.87rem;
       font-weight: 600;
-      color: #333;
+      color: #2b2b3c;
       margin-bottom: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .preview {
@@ -195,43 +238,200 @@ export class ViewMailbox extends LitElement {
       margin-bottom: 18px;
     }
 
+    .reader-subject-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
     .reader-header h2 {
-      margin: 0 0 10px 0;
-      font-size: 1.25rem;
+      margin: 0;
+      font-size: 1.28rem;
+      color: #1a1a2e;
+      line-height: 1.35;
+    }
+
+    .sender-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: #faf8ff;
+      border: 1px solid #ece3ff;
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+
+    .sender-card-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .sender-meta {
+      font-size: 0.85rem;
+      color: #444;
+      line-height: 1.45;
+    }
+
+    .sender-meta strong {
+      font-size: 0.94rem;
       color: #1a1a2e;
     }
 
-    .meta-row {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 8px;
-      font-size: 0.84rem;
-      color: #555;
+    .email-pill {
+      color: #6200ee;
+      font-family: monospace;
+      font-size: 0.81rem;
+      background: #f0e6ff;
+      padding: 1px 6px;
+      border-radius: 4px;
     }
 
     .spf-badge {
       background: #e8f5e9;
       color: #2e7d32;
       font-weight: 700;
-      font-size: 0.73rem;
-      padding: 3px 8px;
+      font-size: 0.74rem;
+      padding: 4px 10px;
       border-radius: 6px;
+      border: 1px solid #c8e6c9;
+      white-space: nowrap;
     }
 
-    .reader-actions {
+    .meta-drawer {
+      margin-top: 10px;
+      font-size: 0.81rem;
+      color: #444;
+      background: #fcfcfe;
+      border: 1px solid #e6e4f0;
+      border-radius: 8px;
+      padding: 8px 12px;
+    }
+
+    .meta-drawer summary {
+      cursor: pointer;
+      font-weight: 600;
+      color: #555;
+      user-select: none;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      gap: 6px 12px;
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px dashed #e0dce8;
+    }
+
+    .meta-label {
+      font-weight: 600;
+      color: #666;
+    }
+
+    .security-pills {
       display: flex;
-      gap: 8px;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .sec-pill {
+      background: #eefaf0;
+      color: #1b5e20;
+      border: 1px solid #c8e6c9;
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 0.73rem;
+      font-weight: 600;
+    }
+
+    .reader-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
       margin-top: 12px;
     }
 
-    .reader-body {
+    .reader-actions,
+    .render-mode-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .reader-body-rich {
+      line-height: 1.7;
+      color: #242433;
+      font-size: 0.96rem;
+      flex: 1;
+      word-break: break-word;
+    }
+
+    .reader-body-rich a {
+      color: #6200ee;
+      text-decoration: underline;
+    }
+
+    .reader-body-rich blockquote {
+      margin: 10px 0;
+      padding: 8px 14px;
+      border-left: 3px solid #9c27b0;
+      background: #faf7ff;
+      color: #555;
+      border-radius: 0 6px 6px 0;
+    }
+
+    .reader-body-rich hr {
+      border: none;
+      border-top: 1px solid #e5e0f0;
+      margin: 16px 0;
+    }
+
+    .reader-body-rich pre,
+    .reader-body-rich code {
+      background: #f5f2fa;
+      border-radius: 4px;
+      padding: 2px 5px;
+      font-family: monospace;
+      font-size: 0.86rem;
+    }
+
+    .reader-body-plain {
       white-space: pre-wrap;
       line-height: 1.65;
       color: #2c2c38;
-      font-size: 0.95rem;
+      font-size: 0.93rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      background: #fafafe;
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid #ececf4;
       flex: 1;
+    }
+
+    .meta-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.82rem;
+    }
+
+    .meta-table th,
+    .meta-table td {
+      padding: 8px 10px;
+      border: 1px solid #e6e4f0;
+      text-align: left;
+    }
+
+    .meta-table th {
+      background: #f4f0ff;
+      color: #3700b3;
     }
 
     .empty-state {
@@ -258,14 +458,28 @@ export class ViewMailbox extends LitElement {
       this.selectedMessage = null;
       this.loadFolder();
     }
+    this._syncSanitizedRichBody();
+  }
+
+  private _syncSanitizedRichBody() {
+    if (!this.selectedMessage || this.renderMode !== 'rich') return;
+    const container = this.renderRoot.querySelector('.reader-body-rich') as HTMLElement | null;
+    if (container) {
+      safeSetEmailHTML(container, this.selectedMessage.cleanHtml);
+    }
   }
 
   async loadFolder() {
     this.loading = true;
     try {
-      this.messages = await mailService.fetchMessages(this.folder, this.searchQuery);
-      if (this.messages.length > 0 && !this.selectedMessage) {
-        this.selectedMessage = this.messages[0];
+      const rawMessages = await mailService.fetchMessages(this.folder, this.searchQuery);
+      this.messages = rawMessages.map((m) => normalizeMailMessage(m));
+      if (this.messages.length > 0) {
+        const currentId = this.selectedMessage?.id;
+        this.selectedMessage =
+          this.messages.find((m) => m.id === currentId) ?? this.messages[0];
+      } else {
+        this.selectedMessage = null;
       }
     } catch {
       this.messages = [];
@@ -274,7 +488,7 @@ export class ViewMailbox extends LitElement {
     }
   }
 
-  private async _selectMessage(msg: MailMessage) {
+  private async _selectMessage(msg: NormalizedMailMessage) {
     this.selectedMessage = msg;
     if (!msg.is_read) {
       msg.is_read = true;
@@ -283,7 +497,7 @@ export class ViewMailbox extends LitElement {
     }
   }
 
-  private async _toggleStar(msg: MailMessage, e: Event) {
+  private async _toggleStar(msg: NormalizedMailMessage, e: Event) {
     e.stopPropagation();
     const next = !msg.is_starred;
     msg.is_starred = next;
@@ -291,27 +505,28 @@ export class ViewMailbox extends LitElement {
     await mailService.updateMessage(msg.id, { is_starred: next });
   }
 
-  private async _moveFolder(msg: MailMessage, targetFolder: string) {
+  private async _moveFolder(msg: NormalizedMailMessage, targetFolder: string) {
     await mailService.updateMessage(msg.id, { folder: targetFolder });
     this.selectedMessage = null;
     await this.loadFolder();
   }
 
-  private _reply(msg: MailMessage) {
+  private _reply(msg: NormalizedMailMessage) {
     this.dispatchEvent(
       new CustomEvent('open-compose', {
         detail: {
-          to: msg.sender_email,
-          subject: msg.subject.startsWith('Re:') ? msg.subject : `Re: ${msg.subject}`
+          to: msg.senderAddress,
+          subject: msg.subject.startsWith('Re:') ? msg.subject : `Re: ${msg.subject}`,
         },
         bubbles: true,
-        composed: true
+        composed: true,
       })
     );
   }
 
   render() {
     const user = authService.getUser();
+    const msg = this.selectedMessage;
 
     return html`
       <div class="org-banner">
@@ -349,60 +564,155 @@ export class ViewMailbox extends LitElement {
             : this.messages.map(
                 (m) => html`
                   <div
-                    class="msg-row ${!m.is_read ? 'unread' : ''} ${this.selectedMessage?.id === m.id
-                      ? 'active'
-                      : ''}"
+                    class="msg-row ${!m.is_read ? 'unread' : ''} ${msg?.id === m.id ? 'active' : ''}"
                     @click=${() => this._selectMessage(m)}>
-                    <div class="msg-top">
-                      <span class="sender">
-                        <span
-                          @click=${(e: Event) => this._toggleStar(m, e)}
-                          style="color:${m.is_starred ? '#f59e0b' : '#ccc'}; margin-right:6px;">
-                          ★
+                    <div class="avatar-circle">${m.senderInitials}</div>
+                    <div class="msg-content">
+                      <div class="msg-top">
+                        <span class="sender">
+                          <span
+                            @click=${(e: Event) => this._toggleStar(m, e)}
+                            style="color:${m.is_starred ? '#f59e0b' : '#ccc'}; margin-right:5px;">
+                            ★
+                          </span>
+                          ${this.folder === 'sent' ? `To: ${m.recipient_email}` : m.senderDisplayName}
                         </span>
-                        ${this.folder === 'sent' ? `To: ${m.recipient_email}` : m.sender_name}
-                      </span>
-                      <span class="date">${m.received_at.slice(0, 16)}</span>
+                        <span class="date">${m.formattedDateShort}</span>
+                      </div>
+                      <div class="subject">${m.subject}</div>
+                      <div class="preview">${m.cleanPreview}</div>
                     </div>
-                    <div class="subject">${m.subject}</div>
-                    <div class="preview">${m.preview}</div>
                   </div>
                 `
               )}
         </div>
 
         <div class="reader-pane">
-          ${this.selectedMessage
+          ${msg
             ? html`
                 <div class="reader-header">
-                  <h2>${this.selectedMessage.subject}</h2>
-                  <div class="meta-row">
-                    <div>
-                      <strong>From:</strong> ${this.selectedMessage.sender_name}
-                      &lt;${this.selectedMessage.sender_email}&gt;<br />
-                      <strong>To:</strong> ${this.selectedMessage.recipient_email}
-                    </div>
-                    <span class="spf-badge">✓ ${this.selectedMessage.spf_dmarc_status}</span>
+                  <div class="reader-subject-row">
+                    <h2>${msg.subject}</h2>
+                    <span class="spf-badge">✓ ${msg.spf_dmarc_status}</span>
                   </div>
-                  <div class="reader-actions">
-                    <button
-                      class="btn-action"
-                      @click=${() => this._reply(this.selectedMessage!)}>
-                      ↩ Reply
-                    </button>
-                    <button
-                      class="btn-action"
-                      @click=${() => this._moveFolder(this.selectedMessage!, 'archive')}>
-                      📥 Archive
-                    </button>
-                    <button
-                      class="btn-action"
-                      @click=${() => this._moveFolder(this.selectedMessage!, 'trash')}>
-                      🗑 Trash
-                    </button>
+
+                  <div class="sender-card">
+                    <div class="sender-card-left">
+                      <div class="avatar-circle">${msg.senderInitials}</div>
+                      <div class="sender-meta">
+                        <div>
+                          <strong>${msg.senderDisplayName}</strong>
+                          <span class="email-pill">&lt;${msg.senderAddress}&gt;</span>
+                        </div>
+                        <div>
+                          <strong>To:</strong>
+                          <span class="email-pill">${msg.recipient_email}</span>
+                          • <span>${msg.formattedDateFull}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <details class="meta-drawer">
+                    <summary>🔐 Security, Authentication &amp; MIME Envelope Metadata</summary>
+                    <div class="meta-grid">
+                      <span class="meta-label">Message ID:</span>
+                      <span><code>${msg.id}</code></span>
+                      <span class="meta-label">Sender Domain:</span>
+                      <span><code>${msg.senderDomain}</code></span>
+                      <span class="meta-label">Authentication:</span>
+                      <div class="security-pills">
+                        ${msg.securityBadges.map(
+                          (b) => html`<span class="sec-pill">✓ ${b.label}</span>`
+                        )}
+                      </div>
+                      <span class="meta-label">MIME Structure:</span>
+                      <span>
+                        ${msg.mimeBoundary
+                          ? html`Multipart (boundary: <code>${msg.mimeBoundary}</code>)`
+                          : html`Standard RFC 5322 (${msg.mimeParts.length} part)`}
+                      </span>
+                    </div>
+                  </details>
+
+                  <div class="reader-toolbar">
+                    <div class="reader-actions">
+                      <button class="btn-action" @click=${() => this._reply(msg)}>
+                        ↩ Reply
+                      </button>
+                      <button
+                        class="btn-action"
+                        @click=${() => this._moveFolder(msg, 'archive')}>
+                        📥 Archive
+                      </button>
+                      <button class="btn-action" @click=${() => this._moveFolder(msg, 'trash')}>
+                        🗑 Trash
+                      </button>
+                    </div>
+
+                    <div class="render-mode-tabs">
+                      <button
+                        class="btn-action ${this.renderMode === 'rich' ? 'active' : ''}"
+                        @click=${() => {
+                          this.renderMode = 'rich';
+                        }}>
+                        ✨ Rich View
+                      </button>
+                      <button
+                        class="btn-action ${this.renderMode === 'plain' ? 'active' : ''}"
+                        @click=${() => {
+                          this.renderMode = 'plain';
+                        }}>
+                        📄 Plain Text
+                      </button>
+                      <button
+                        class="btn-action ${this.renderMode === 'meta' ? 'active' : ''}"
+                        @click=${() => {
+                          this.renderMode = 'meta';
+                        }}>
+                        🔍 MIME Inspector
+                      </button>
+                    </div>
                   </div>
                 </div>
-                <div class="reader-body">${this.selectedMessage.body_text}</div>
+
+                ${this.renderMode === 'rich'
+                  ? html`<div class="reader-body-rich"></div>`
+                  : this.renderMode === 'plain'
+                  ? html`<div class="reader-body-plain">${msg.cleanText}</div>`
+                  : html`
+                      <div class="reader-body-plain">
+                        <strong>Parsed MIME Parts (${msg.mimeParts.length}):</strong>
+                        <table class="meta-table">
+                          <thead>
+                            <tr>
+                              <th>Part #</th>
+                              <th>Content-Type</th>
+                              <th>Charset</th>
+                              <th>Transfer-Encoding</th>
+                              <th>Decoded Size</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            ${msg.mimeParts.map(
+                              (p, idx) => html`
+                                <tr>
+                                  <td>#${idx + 1}</td>
+                                  <td><code>${p.contentType}</code></td>
+                                  <td><code>${p.charset}</code></td>
+                                  <td><code>${p.transferEncoding}</code></td>
+                                  <td>${p.sizeBytes} bytes</td>
+                                </tr>
+                              `
+                            )}
+                          </tbody>
+                        </table>
+                        <br />
+                        <strong>Extracted Clean Plain-Text Stream:</strong>
+                        <hr />
+                        ${msg.cleanText}
+                      </div>
+                    `}
               `
             : html`<div class="empty-state">Select a message to read its full contents.</div>`}
         </div>

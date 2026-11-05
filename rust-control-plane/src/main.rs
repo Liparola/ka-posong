@@ -1030,23 +1030,23 @@ async fn ingest_tunneled_mime_handler(
     // 1. Parse RFC822 MIME summary and persist in SQLite inbox index for instant uMail PWA access
     let parsed = parse_rfc822_summary(&body, env_from);
     let msg_id = format!("ing_{}", uuid::Uuid::new_v4().simple());
-    let preview: String = parsed.body_text.chars().take(120).collect();
     let raw_str = String::from_utf8_lossy(&body).to_string();
 
     sqlx::query(
         r#"INSERT INTO mail_messages
-           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, raw_mime, is_read, spf_dmarc_status)
-           VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
+           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status)
+           VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
     )
     .bind(&msg_id)
     .bind(&tenant_id)
     .bind(&env_to)
-    .bind(&parsed.from_header)
-    .bind(env_from)
+    .bind(&parsed.sender_name)
+    .bind(&parsed.sender_email)
     .bind(&env_to)
     .bind(&parsed.subject)
-    .bind(&preview)
+    .bind(&parsed.preview)
     .bind(&parsed.body_text)
+    .bind(&parsed.body_html)
     .bind(&raw_str)
     .bind(&parsed.spf_dmarc_status)
     .execute(&state.db)
@@ -1236,6 +1236,36 @@ async fn initialize_database_and_seed_liparola(
         .execute(pool)
         .await
         .map_err(|e| e.to_string())?;
+    }
+
+    // Re-parse any existing stored messages that have raw_mime so legacy multipart boundaries are cleaned up
+    if let Ok(existing_rows) = sqlx::query(
+        "SELECT id, sender_email, raw_mime FROM mail_messages WHERE raw_mime IS NOT NULL AND raw_mime != ''",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        for row in existing_rows {
+            let id: String = row.get("id");
+            let sender_email: String = row.get("sender_email");
+            let raw_mime: String = row.get("raw_mime");
+            let parsed = parse_rfc822_summary(raw_mime.as_bytes(), &sender_email);
+            let _ = sqlx::query(
+                r#"UPDATE mail_messages
+                   SET sender_name = ?, sender_email = ?, subject = ?, preview = ?, body_text = ?, body_html = ?, spf_dmarc_status = ?
+                   WHERE id = ?"#,
+            )
+            .bind(&parsed.sender_name)
+            .bind(&parsed.sender_email)
+            .bind(&parsed.subject)
+            .bind(&parsed.preview)
+            .bind(&parsed.body_text)
+            .bind(&parsed.body_html)
+            .bind(&parsed.spf_dmarc_status)
+            .bind(&id)
+            .execute(pool)
+            .await;
+        }
     }
 
     Ok(())
