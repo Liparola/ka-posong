@@ -44,9 +44,13 @@ module.exports = {
         BRIDGE_SECRET: 'cf-tunnel-secret',
         ALLOW_DEV_OTP_PREVIEW: 'true',
         // Outbound HTTPS Email Relay (Port 443 — bypasses ISP/VPN Port 25/587 blocks):
-        // 1. Cloudflare Email Sending Service (Beta) Direct REST API:
-        CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN || '',
-        CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID || '5d34290efd0db9537a45b9bb167f6e7f',
+        // 1. Cloudflare Email Sending Service (Beta) Direct REST API & SMTPS (Port 465):
+        CLOUDFLARE_API_TOKEN:
+          process.env.CLOUDFLARE_API_TOKEN ||
+          'replace-with-cloudflare-api-token',
+        CLOUDFLARE_ACCOUNT_ID:
+          process.env.CLOUDFLARE_ACCOUNT_ID ||
+          '5d34290efd0db9537a45b9bb167f6e7f',
         // 2. Cloudflare Worker Edge Relay URL:
         OUTBOUND_WORKER_URL: process.env.OUTBOUND_WORKER_URL || '',
         // 3. Fallbacks (Resend / Brevo):

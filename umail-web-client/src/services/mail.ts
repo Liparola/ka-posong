@@ -67,7 +67,12 @@ class MailService extends EventTarget {
     bodyHtml?: string,
     inReplyTo?: string,
     threadId?: string
-  ): Promise<{ status: string; delivery_provider?: string }> {
+  ): Promise<{
+    status: string;
+    delivery_provider?: string;
+    relayed_externally?: boolean;
+    message_id?: string;
+  }> {
     const token = authService.getToken();
     if (!token) throw new Error('Not authenticated');
 
@@ -92,7 +97,12 @@ class MailService extends EventTarget {
       throw new Error(err.error ?? `Failed to send email (${res.status})`);
     }
 
-    const result = (await res.json()) as { status: string; delivery_provider?: string };
+    const result = (await res.json()) as {
+      status: string;
+      delivery_provider?: string;
+      relayed_externally?: boolean;
+      message_id?: string;
+    };
     this.dispatchEvent(new CustomEvent('mail-updated'));
     return result;
   }

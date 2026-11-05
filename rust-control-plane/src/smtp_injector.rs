@@ -582,7 +582,7 @@ pub async fn dispatch_outbound_email(
             let cf_account = std::env::var("CLOUDFLARE_ACCOUNT_ID")
                 .unwrap_or_else(|_| "5d34290efd0db9537a45b9bb167f6e7f".to_string());
             let endpoint = format!(
-                "https://api.cloudflare.com/client/v4/accounts/{}/email/sending",
+                "https://api.cloudflare.com/client/v4/accounts/{}/email/sending/send",
                 cf_account.trim()
             );
 
@@ -618,6 +618,41 @@ pub async fn dispatch_outbound_email(
                 }
                 Err(e) => {
                     tracing::warn!("⚠️ Cloudflare Email Sending REST API error: {}", e);
+                }
+            }
+
+            // Strategy 1B: Cloudflare SMTPS (Implicit TLS Port 465)
+            // Host: smtp.mx.cloudflare.net:465 with api_token:<token>
+            let mut curl_cmd = tokio::process::Command::new("curl");
+            curl_cmd
+                .arg("-sS")
+                .arg("--ssl-reqd")
+                .arg("--url")
+                .arg("smtps://smtp.mx.cloudflare.net:465")
+                .arg("--user")
+                .arg(format!("api_token:{}", cf_token))
+                .arg("--mail-from")
+                .arg(from_email)
+                .arg("--mail-rcpt")
+                .arg(to_email)
+                .arg("-T")
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            if let Ok(mut child) = curl_cmd.spawn() {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(raw_mime.as_bytes()).await;
+                }
+                if let Ok(output) = child.wait_with_output().await {
+                    if output.status.success() {
+                        tracing::info!("✅ Outbound dispatched via Cloudflare SMTPS (Port 465) to {}", to_email);
+                        return (true, "cloudflare-smtps-port465".to_string());
+                    } else {
+                        let err_msg = String::from_utf8_lossy(&output.stderr);
+                        tracing::warn!("⚠️ Cloudflare SMTPS (Port 465) returned {}: {}", output.status, err_msg.trim());
+                    }
                 }
             }
         }

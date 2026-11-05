@@ -379,10 +379,11 @@ pub async fn send_umail_message(
     .await;
 
     Ok(Json(serde_json::json!({
-        "status": "SENT",
+        "status": if injected { "SENT" } else { "QUEUED_LOCALLY" },
         "message_id": msg_id,
         "from": claims.email,
         "to": recipient,
+        "relayed_externally": injected,
         "stalwart_relayed": injected,
         "delivery_provider": delivery_provider
     })))

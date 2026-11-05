@@ -26,10 +26,17 @@ export class ViewMailbox extends LitElement {
   // Inline Quick Reply State
   @state() private inlineReplyText = '';
   @state() private inlineReplySending = false;
+  @state() private inlineReplyStage = '';
   @state() private inlineReplyNotice = '';
   @state() private inlineReplyError = '';
 
+  // Toast Banner State
+  @state() private toastMessage = '';
+  @state() private toastType: 'success' | 'warning' | 'error' = 'success';
+  private _toastTimeout?: number;
+
   private _mailUpdateHandler!: () => void;
+  private _emailSentHandler!: (e: Event) => void;
 
   static styles = css`
     :host {
@@ -521,6 +528,66 @@ export class ViewMailbox extends LitElement {
       display: flex;
       flex-direction: column;
       gap: 10px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .progress-bar-thin {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3.5px;
+      background: linear-gradient(90deg, #6200ee 0%, #00e5ff 50%, #7c4dff 100%);
+      background-size: 200% 100%;
+      animation: thinBarProgress 1.2s ease-in-out infinite;
+      z-index: 20;
+    }
+
+    @keyframes thinBarProgress {
+      0% {
+        background-position: 100% 0;
+      }
+      100% {
+        background-position: -100% 0;
+      }
+    }
+
+    .sent-toast {
+      position: fixed;
+      top: 20px;
+      right: 24px;
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 18px;
+      background: #1b5e20;
+      color: #fff;
+      font-size: 0.9rem;
+      font-weight: 600;
+      border-radius: 10px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+      animation: toastSlideIn 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .sent-toast.warning {
+      background: #e65100;
+    }
+
+    .sent-toast.error {
+      background: #c62828;
+    }
+
+    @keyframes toastSlideIn {
+      from {
+        opacity: 0;
+        transform: translateY(-20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
     }
 
     .reply-header {
@@ -599,12 +666,32 @@ export class ViewMailbox extends LitElement {
     super.connectedCallback();
     this._mailUpdateHandler = () => this.loadFolder();
     mailService.addEventListener('mail-updated', this._mailUpdateHandler);
+
+    this._emailSentHandler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail?.message) {
+        this._showToast(detail.message, detail.relayedExternally ? 'success' : 'warning');
+      }
+    };
+    window.addEventListener('email-sent', this._emailSentHandler);
+
     this.loadFolder();
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     mailService.removeEventListener('mail-updated', this._mailUpdateHandler);
+    window.removeEventListener('email-sent', this._emailSentHandler);
+    if (this._toastTimeout) clearTimeout(this._toastTimeout);
+  }
+
+  private _showToast(msg: string, type: 'success' | 'warning' | 'error' = 'success') {
+    if (this._toastTimeout) clearTimeout(this._toastTimeout);
+    this.toastMessage = msg;
+    this.toastType = type;
+    this._toastTimeout = window.setTimeout(() => {
+      this.toastMessage = '';
+    }, 4500);
   }
 
   updated(changed: Map<string, unknown>) {
@@ -762,8 +849,13 @@ export class ViewMailbox extends LitElement {
     const subject = cleanSubj.toLowerCase().startsWith('re:') ? cleanSubj : `Re: ${cleanSubj}`;
 
     this.inlineReplySending = true;
+    this.inlineReplyStage = 'Contacting Cloudflare edge relay...';
     this.inlineReplyError = '';
     this.inlineReplyNotice = '';
+
+    const stageTimer = setTimeout(() => {
+      this.inlineReplyStage = 'Transmitting RFC 5322 MIME envelope...';
+    }, 450);
 
     try {
       const res = await mailService.sendMessage(
@@ -774,13 +866,28 @@ export class ViewMailbox extends LitElement {
         latest.id,
         this.selectedThread.threadKey.replace(/^tid_/, '').replace(/^subj_/, '')
       );
+      clearTimeout(stageTimer);
       this.inlineReplyText = '';
-      this.inlineReplyNotice = `Dispatched via ${res.delivery_provider ?? 'Cloudflare Email Service'}`;
+
+      const provider = res.delivery_provider ?? 'Cloudflare Email Service';
+      const isExternal = res.relayed_externally === true;
+
+      if (isExternal) {
+        this._showToast(`✓ Reply sent & delivered to ${to} via ${provider}`, 'success');
+      } else {
+        this._showToast(
+          `✓ Reply saved to Sent folder (${provider}). External delivery queued.`,
+          'warning'
+        );
+      }
       await this.loadFolder();
     } catch (err: unknown) {
+      clearTimeout(stageTimer);
       this.inlineReplyError = err instanceof Error ? err.message : 'Failed to send reply';
+      this._showToast(`⚠️ Failed to send reply: ${this.inlineReplyError}`, 'error');
     } finally {
       this.inlineReplySending = false;
+      this.inlineReplyStage = '';
     }
   }
 
@@ -801,6 +908,19 @@ export class ViewMailbox extends LitElement {
     const thread = this.selectedThread;
 
     return html`
+      ${this.toastMessage
+        ? html`
+            <div class="sent-toast ${this.toastType}">
+              <span>${this.toastMessage}</span>
+              <button
+                style="background:transparent; border:none; color:#fff; cursor:pointer; font-weight:bold; font-size:1.1rem; line-height:1;"
+                @click=${() => (this.toastMessage = '')}>
+                &times;
+              </button>
+            </div>
+          `
+        : ''}
+
       <div class="org-banner">
         <div>
           <h3>${user?.email ?? 'uMail Inbox'}</h3>
@@ -1007,6 +1127,8 @@ export class ViewMailbox extends LitElement {
 
                 <!-- Inline Quick Reply Box (Gmail & Outlook UX) -->
                 <div class="inline-reply-box">
+                  ${this.inlineReplySending ? html`<div class="progress-bar-thin"></div>` : ''}
+
                   <div class="reply-header">
                     <span>
                       ↩ Reply to
@@ -1027,6 +1149,7 @@ export class ViewMailbox extends LitElement {
                   <textarea
                     placeholder="Write a reply... (Enter your response here)"
                     .value=${this.inlineReplyText}
+                    ?disabled=${this.inlineReplySending}
                     @input=${(e: Event) => {
                       this.inlineReplyText = (e.target as HTMLTextAreaElement).value;
                     }}></textarea>
@@ -1042,6 +1165,7 @@ export class ViewMailbox extends LitElement {
                     <button
                       class="btn-action"
                       style="padding: 6px 12px; font-size: 0.8rem;"
+                      ?disabled=${this.inlineReplySending}
                       @click=${() => this._quoteOriginalText()}>
                       📄 Quote text
                     </button>
@@ -1049,7 +1173,9 @@ export class ViewMailbox extends LitElement {
                       class="btn-send-reply"
                       ?disabled=${this.inlineReplySending}
                       @click=${() => this._sendInlineReply()}>
-                      ${this.inlineReplySending ? '🚀 Sending via Cloudflare...' : '🚀 Send Reply'}
+                      ${this.inlineReplySending
+                        ? html`<span>⏳ ${this.inlineReplyStage || 'Sending reply...'}</span>`
+                        : '🚀 Send Reply'}
                     </button>
                   </div>
                 </div>

@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kaposong-email-ingress",
+  "main": "email-ingress-worker.js",
+  "compatibility_date": "2026-01-01",
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "remote": true
+    }
+  ],
+  "vars": {
+    "TAILSCALE_INGRESS_URL": "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email",
+    "BRIDGE_SECRET": "cf-tunnel-secret"
+  }
+}

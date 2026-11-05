@@ -18,6 +18,7 @@ export class ComposeModal extends LitElement {
   @state() private inReplyTo = '';
   @state() private threadId = '';
   @state() private sending = false;
+  @state() private sendingStage = '';
   @state() private error = '';
   @state() private successNotice = '';
 
@@ -33,6 +34,8 @@ export class ComposeModal extends LitElement {
       box-shadow: 0 20px 45px rgba(0, 0, 0, 0.25);
       background: #fff;
       color: #333;
+      position: relative;
+      overflow: hidden;
     }
 
     dialog:modal {
@@ -43,6 +46,27 @@ export class ComposeModal extends LitElement {
       background: rgba(20, 14, 38, 0.55);
       overflow: hidden;
       overscroll-behavior: contain;
+    }
+
+    .progress-bar-thin {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3.5px;
+      background: linear-gradient(90deg, #6200ee 0%, #00e5ff 50%, #7c4dff 100%);
+      background-size: 200% 100%;
+      animation: thinBarProgress 1.2s ease-in-out infinite;
+      z-index: 20;
+    }
+
+    @keyframes thinBarProgress {
+      0% {
+        background-position: 100% 0;
+      }
+      100% {
+        background-position: -100% 0;
+      }
     }
 
     .modal-header {
@@ -195,8 +219,13 @@ export class ComposeModal extends LitElement {
       return;
     }
     this.sending = true;
+    this.sendingStage = 'Connecting to Cloudflare edge relay...';
     this.error = '';
     this.successNotice = '';
+
+    const stageTimer = setTimeout(() => {
+      this.sendingStage = 'Transmitting signed MIME envelope...';
+    }, 450);
 
     try {
       const res = await mailService.sendMessage(
@@ -207,12 +236,35 @@ export class ComposeModal extends LitElement {
         this.inReplyTo || undefined,
         this.threadId || undefined
       );
-      this.successNotice = `Dispatched via ${res.delivery_provider ?? 'Cloudflare Email Service'}`;
-      setTimeout(() => this.close(), 600);
+      clearTimeout(stageTimer);
+
+      const provider = res.delivery_provider ?? 'Cloudflare Email Service';
+      const isExternal = res.relayed_externally === true;
+
+      if (isExternal) {
+        this.successNotice = `✓ Sent & delivered to ${this.to.trim()} via ${provider}`;
+      } else {
+        this.successNotice = `✓ Saved in Sent mailbox (${provider}). External delivery queued.`;
+      }
+
+      window.dispatchEvent(
+        new CustomEvent('email-sent', {
+          detail: {
+            to: this.to.trim(),
+            provider,
+            relayedExternally: isExternal,
+            message: this.successNotice
+          }
+        })
+      );
+
+      setTimeout(() => this.close(), 1200);
     } catch (err: unknown) {
+      clearTimeout(stageTimer);
       this.error = err instanceof Error ? err.message : 'Failed to send message';
     } finally {
       this.sending = false;
+      this.sendingStage = '';
     }
   }
 
@@ -220,6 +272,8 @@ export class ComposeModal extends LitElement {
     const user = authService.getUser();
     return html`
       <dialog aria-labelledby="compose-title">
+        ${this.sending ? html`<div class="progress-bar-thin"></div>` : ''}
+
         <div class="modal-header">
           <h2 id="compose-title">
             ${this.inReplyTo ? '↩ Reply to Message' : 'Compose New Email'}
@@ -247,6 +301,7 @@ export class ComposeModal extends LitElement {
               autofocus
               placeholder="client@organization.co.ls"
               .value=${this.to}
+              ?disabled=${this.sending}
               @input=${(e: Event) => (this.to = (e.target as HTMLInputElement).value)}
             />
           </div>
@@ -259,6 +314,7 @@ export class ComposeModal extends LitElement {
               required
               placeholder="Proposal &amp; Invoice"
               .value=${this.subject}
+              ?disabled=${this.sending}
               @input=${(e: Event) => (this.subject = (e.target as HTMLInputElement).value)}
             />
           </div>
@@ -270,16 +326,23 @@ export class ComposeModal extends LitElement {
               required
               placeholder="Write your message..."
               .value=${this.bodyText}
+              ?disabled=${this.sending}
               @input=${(e: Event) => (this.bodyText = (e.target as HTMLTextAreaElement).value)}></textarea>
           </div>
 
-          ${this.error ? html`<div class="error">${this.error}</div>` : ''}
-          ${this.successNotice ? html`<div style="color: #2e7d32; font-size: 0.85rem; font-weight: 600;">✓ ${this.successNotice}</div>` : ''}
+          ${this.error ? html`<div class="error">⚠️ ${this.error}</div>` : ''}
+          ${this.successNotice
+            ? html`<div style="color: #2e7d32; font-size: 0.88rem; font-weight: 700; background: #e8f5e9; padding: 8px 12px; border-radius: 6px;">
+                ${this.successNotice}
+              </div>`
+            : ''}
 
           <div class="actions">
-            <button type="button" class="btn-cancel" @click=${this.close}>Cancel</button>
+            <button type="button" class="btn-cancel" @click=${this.close} ?disabled=${this.sending}>Cancel</button>
             <button type="submit" class="btn-send" ?disabled=${this.sending}>
-              ${this.sending ? 'Sending via Cloudflare...' : 'Send Email'}
+              ${this.sending
+                ? html`<span>⏳ ${this.sendingStage || 'Sending...'}</span>`
+                : '🚀 Send Email'}
             </button>
           </div>
         </form>
