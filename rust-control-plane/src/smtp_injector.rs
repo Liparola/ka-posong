@@ -21,6 +21,9 @@ pub struct ParsedMimeSummary {
     pub body_html: Option<String>,
     pub preview: String,
     pub spf_dmarc_status: String,
+    pub in_reply_to: Option<String>,
+    pub message_id: Option<String>,
+    pub references: Option<String>,
 }
 
 /// Splits headers and body from a raw RFC 5322 block
@@ -357,6 +360,9 @@ pub fn parse_rfc822_summary(raw_mime: &[u8], fallback_from: &str) -> ParsedMimeS
     let mut subject = "(No Subject)".to_string();
     let mut raw_from_header = fallback_from.to_string();
     let mut spf_dmarc = "PASS (DKIM+SPF)".to_string();
+    let mut in_reply_to: Option<String> = None;
+    let mut message_id: Option<String> = None;
+    let mut references: Option<String> = None;
 
     for (k, v) in &headers {
         if k == "subject" {
@@ -366,6 +372,21 @@ pub fn parse_rfc822_summary(raw_mime: &[u8], fallback_from: &str) -> ParsedMimeS
             }
         } else if k == "from" {
             raw_from_header = v.clone();
+        } else if k == "in-reply-to" {
+            let cleaned = v.trim().trim_matches('<').trim_matches('>').trim().to_string();
+            if !cleaned.is_empty() {
+                in_reply_to = Some(cleaned);
+            }
+        } else if k == "message-id" {
+            let cleaned = v.trim().trim_matches('<').trim_matches('>').trim().to_string();
+            if !cleaned.is_empty() {
+                message_id = Some(cleaned);
+            }
+        } else if k == "references" {
+            let cleaned = v.trim().to_string();
+            if !cleaned.is_empty() {
+                references = Some(cleaned);
+            }
         } else if k == "authentication-results" {
             let lower = v.to_ascii_lowercase();
             let spf_ok = lower.contains("spf=pass");
@@ -431,6 +452,9 @@ pub fn parse_rfc822_summary(raw_mime: &[u8], fallback_from: &str) -> ParsedMimeS
         body_html: extracted_html,
         preview,
         spf_dmarc_status: spf_dmarc,
+        in_reply_to,
+        message_id,
+        references,
     }
 }
 
@@ -546,12 +570,64 @@ pub async fn dispatch_outbound_email(
     raw_mime: &str,
 ) -> (bool, String) {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(12))
         .build()
         .unwrap_or_default();
 
-    // Strategy 1: Cloudflare Bidirectional Email Worker (`CLOUDFLARE_OUTBOUND_WORKER_URL`) over HTTPS Port 443
-    if let Ok(cf_url) = std::env::var("CLOUDFLARE_OUTBOUND_WORKER_URL") {
+    // Strategy 1: Cloudflare Email Sending Service REST API (Direct HTTPS Port 443)
+    // Uses Cloudflare Account ID & API Token with "Email Sending: Edit" permissions
+    if let Ok(cf_token) = std::env::var("CLOUDFLARE_API_TOKEN") {
+        let cf_token = cf_token.trim();
+        if !cf_token.is_empty() {
+            let cf_account = std::env::var("CLOUDFLARE_ACCOUNT_ID")
+                .unwrap_or_else(|_| "5d34290efd0db9537a45b9bb167f6e7f".to_string());
+            let endpoint = format!(
+                "https://api.cloudflare.com/client/v4/accounts/{}/email/sending",
+                cf_account.trim()
+            );
+
+            let mut req_body = serde_json::json!({
+                "from": from_email,
+                "to": to_email,
+                "subject": subject,
+                "text": body_text,
+            });
+            if let Some(html) = body_html {
+                if !html.is_empty() {
+                    req_body["html"] = serde_json::Value::String(html.to_string());
+                }
+            }
+
+            match client
+                .post(&endpoint)
+                .bearer_auth(cf_token)
+                .header("Content-Type", "application/json")
+                .json(&req_body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let resp_txt = resp.text().await.unwrap_or_default();
+                    if status.is_success() {
+                        tracing::info!("✅ Outbound dispatched via Cloudflare Email Sending REST API: {}", resp_txt);
+                        return (true, "cloudflare-email-sending-rest-api".to_string());
+                    } else {
+                        tracing::warn!("⚠️ Cloudflare Email Sending REST API returned {}: {}", status, resp_txt);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️ Cloudflare Email Sending REST API error: {}", e);
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Cloudflare Bidirectional Email Worker (`OUTBOUND_WORKER_URL` or `CLOUDFLARE_OUTBOUND_WORKER_URL`)
+    let worker_url = std::env::var("OUTBOUND_WORKER_URL")
+        .or_else(|_| std::env::var("CLOUDFLARE_OUTBOUND_WORKER_URL"))
+        .ok();
+    if let Some(cf_url) = worker_url {
         let cf_url = cf_url.trim();
         if !cf_url.is_empty() {
             let endpoint = if cf_url.ends_with("/send-email") {
@@ -581,7 +657,7 @@ pub async fn dispatch_outbound_email(
         }
     }
 
-    // Strategy 2: Direct Resend HTTPS API (`RESEND_API_KEY`) over Port 443
+    // Strategy 3: Direct Resend HTTPS API (`RESEND_API_KEY`) over Port 443
     if let Ok(resend_key) = std::env::var("RESEND_API_KEY") {
         let resend_key = resend_key.trim();
         if !resend_key.is_empty() {
@@ -605,7 +681,7 @@ pub async fn dispatch_outbound_email(
         }
     }
 
-    // Strategy 3: Direct Brevo HTTPS API (`BREVO_API_KEY`) over Port 443
+    // Strategy 4: Direct Brevo HTTPS API (`BREVO_API_KEY`) over Port 443
     if let Ok(brevo_key) = std::env::var("BREVO_API_KEY") {
         let brevo_key = brevo_key.trim();
         if !brevo_key.is_empty() {
@@ -629,7 +705,7 @@ pub async fn dispatch_outbound_email(
         }
     }
 
-    // Strategy 4: Local Stalwart / Smart Host SMTP Injection
+    // Strategy 5: Local Stalwart / Smart Host SMTP Injection
     let smtp_ok = inject_smtp_to_stalwart(
         stalwart_smtp_addr,
         from_email,

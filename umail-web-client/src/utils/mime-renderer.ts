@@ -573,3 +573,128 @@ export function normalizeMailMessage(msg: MailMessage): NormalizedMailMessage {
     securityBadges,
   };
 }
+
+/**
+ * Normalizes an email subject to a root thread key by removing Re:, Fwd:, [EXTERNAL], etc.
+ */
+export function normalizeSubjectThreadKey(subject: string): string {
+  if (!subject) return 'no-subject';
+  let clean = decodeRfc2047(subject).trim();
+  // Strip common prefixes repeatedly
+  const prefixRegex = /^(?:\[[\w\s-]+\]\s*)*(?:(?:re|fwd|fw):\s*)+/i;
+  while (prefixRegex.test(clean)) {
+    clean = clean.replace(prefixRegex, '').trim();
+  }
+  return clean.toLowerCase().replace(/\s+/g, ' ') || 'no-subject';
+}
+
+export interface EmailThreadParticipant {
+  name: string;
+  email: string;
+  isSelf: boolean;
+}
+
+export interface EmailThread {
+  id: string; // ID of latest message
+  threadKey: string;
+  subject: string;
+  cleanSubject: string;
+  messages: NormalizedMailMessage[]; // Chronological (oldest to newest)
+  latestMessage: NormalizedMailMessage;
+  participants: EmailThreadParticipant[];
+  participantsSummary: string; // e.g. "Kjamaliehe, me (2)"
+  unreadCount: number;
+  isStarred: boolean;
+  hasReplies: boolean;
+  lastDateShort: string;
+  lastDateFull: string;
+}
+
+/**
+ * Groups an array of messages into rich conversation threads (matching Gmail/Outlook UX).
+ */
+export function groupMessagesIntoThreads(
+  messages: NormalizedMailMessage[],
+  currentUserEmail = ''
+): EmailThread[] {
+  const currentLower = (currentUserEmail || '').trim().toLowerCase();
+  const threadMap = new Map<string, NormalizedMailMessage[]>();
+
+  for (const msg of messages) {
+    const key = msg.thread_id && msg.thread_id.trim().length > 0
+      ? `tid_${msg.thread_id.trim()}`
+      : `subj_${normalizeSubjectThreadKey(msg.subject)}`;
+
+    const existing = threadMap.get(key) || [];
+    existing.push(msg);
+    threadMap.set(key, existing);
+  }
+
+  const threads: EmailThread[] = [];
+
+  for (const [key, msgList] of threadMap.entries()) {
+    // Sort chronological: oldest to newest
+    msgList.sort((a, b) => {
+      const ta = new Date(a.received_at).getTime() || 0;
+      const tb = new Date(b.received_at).getTime() || 0;
+      return ta - tb;
+    });
+
+    const latest = msgList[msgList.length - 1];
+    const unreadCount = msgList.filter((m) => !m.is_read).length;
+    const isStarred = msgList.some((m) => m.is_starred);
+    const hasReplies = msgList.length > 1;
+
+    // Participants deduplication
+    const participantMap = new Map<string, EmailThreadParticipant>();
+    for (const m of msgList) {
+      const isSelf = currentLower.length > 0 && m.senderAddress.toLowerCase() === currentLower;
+      const email = m.senderAddress.toLowerCase();
+      if (!participantMap.has(email)) {
+        participantMap.set(email, {
+          name: isSelf ? 'me' : m.senderDisplayName,
+          email: m.senderAddress,
+          isSelf,
+        });
+      }
+    }
+    const participants = Array.from(participantMap.values());
+
+    // Generate Gmail-style summary: "Kjamaliehe, me (2)"
+    const participantNames = participants.map((p) => p.name);
+    let participantsSummary = participantNames.slice(0, 3).join(', ');
+    if (participantNames.length > 3) {
+      participantsSummary += ` +${participantNames.length - 3}`;
+    }
+    if (msgList.length > 1) {
+      participantsSummary += ` (${msgList.length})`;
+    }
+
+    const cleanSubject = normalizeSubjectThreadKey(latest.subject);
+
+    threads.push({
+      id: latest.id,
+      threadKey: key,
+      subject: latest.subject,
+      cleanSubject: cleanSubject.charAt(0).toUpperCase() + cleanSubject.slice(1),
+      messages: msgList,
+      latestMessage: latest,
+      participants,
+      participantsSummary,
+      unreadCount,
+      isStarred,
+      hasReplies,
+      lastDateShort: latest.formattedDateShort,
+      lastDateFull: latest.formattedDateFull,
+    });
+  }
+
+  // Sort threads by latest message received_at DESC
+  threads.sort((a, b) => {
+    const ta = new Date(a.latestMessage.received_at).getTime() || 0;
+    const tb = new Date(b.latestMessage.received_at).getTime() || 0;
+    return tb - ta;
+  });
+
+  return threads;
+}

@@ -15,8 +15,11 @@ export class ComposeModal extends LitElement {
   @state() private to = '';
   @state() private subject = '';
   @state() private bodyText = '';
+  @state() private inReplyTo = '';
+  @state() private threadId = '';
   @state() private sending = false;
   @state() private error = '';
+  @state() private successNotice = '';
 
   @query('dialog') private dialogEl!: HTMLDialogElement;
 
@@ -164,11 +167,20 @@ export class ComposeModal extends LitElement {
     }
   `;
 
-  public open(prefillTo = '', prefillSubject = '') {
+  public open(
+    prefillTo = '',
+    prefillSubject = '',
+    prefillBody = '',
+    inReplyTo = '',
+    threadId = ''
+  ) {
     this.to = prefillTo;
     this.subject = prefillSubject;
-    this.bodyText = '';
+    this.bodyText = prefillBody;
+    this.inReplyTo = inReplyTo;
+    this.threadId = threadId;
     this.error = '';
+    this.successNotice = '';
     this.dialogEl?.showModal();
   }
 
@@ -184,14 +196,19 @@ export class ComposeModal extends LitElement {
     }
     this.sending = true;
     this.error = '';
+    this.successNotice = '';
 
     try {
-      await mailService.sendMessage(
+      const res = await mailService.sendMessage(
         this.to.trim(),
         this.subject.trim() || '(No Subject)',
-        this.bodyText
+        this.bodyText,
+        undefined,
+        this.inReplyTo || undefined,
+        this.threadId || undefined
       );
-      this.close();
+      this.successNotice = `Dispatched via ${res.delivery_provider ?? 'Cloudflare Email Service'}`;
+      setTimeout(() => this.close(), 600);
     } catch (err: unknown) {
       this.error = err instanceof Error ? err.message : 'Failed to send message';
     } finally {
@@ -204,7 +221,9 @@ export class ComposeModal extends LitElement {
     return html`
       <dialog aria-labelledby="compose-title">
         <div class="modal-header">
-          <h2 id="compose-title">Compose New Email</h2>
+          <h2 id="compose-title">
+            ${this.inReplyTo ? '↩ Reply to Message' : 'Compose New Email'}
+          </h2>
           <button type="button" class="close-btn" @click=${this.close} aria-label="Close compose dialog">
             &times;
           </button>
@@ -213,7 +232,10 @@ export class ComposeModal extends LitElement {
         <form @submit=${this._handleSubmit}>
           <div class="sender-tag">
             From: <strong>${user?.name ?? 'User'} &lt;${user?.email ?? ''}&gt;</strong>
-            (DKIM Signed • UMANG Phone: ${user?.phone ?? ''})
+            <br />
+            <small style="color: #6200ee; font-weight: 600;">
+              ✓ Cloudflare Email Service Active • Verified Domain: ${user?.domain ?? 'liparola.org'}
+            </small>
           </div>
 
           <div class="field">
@@ -251,12 +273,13 @@ export class ComposeModal extends LitElement {
               @input=${(e: Event) => (this.bodyText = (e.target as HTMLTextAreaElement).value)}></textarea>
           </div>
 
-          <div class="error">${this.error}</div>
+          ${this.error ? html`<div class="error">${this.error}</div>` : ''}
+          ${this.successNotice ? html`<div style="color: #2e7d32; font-size: 0.85rem; font-weight: 600;">✓ ${this.successNotice}</div>` : ''}
 
           <div class="actions">
             <button type="button" class="btn-cancel" @click=${this.close}>Cancel</button>
             <button type="submit" class="btn-send" ?disabled=${this.sending}>
-              ${this.sending ? 'Sending via Stalwart...' : 'Send Email'}
+              ${this.sending ? 'Sending via Cloudflare...' : 'Send Email'}
             </button>
           </div>
         </form>

@@ -125,6 +125,11 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 <td class="py-3 px-4 font-mono text-xs text-slate-600">{sel}._domainkey.{dom}</td>
                 <td class="py-3 px-4"><input readonly value="{pk}" class="w-full text-xs font-mono bg-slate-100 p-1.5 rounded border border-slate-200"/></td>
                 <td class="py-3 px-4">{ver_badge}</td>
+                <td class="py-3 px-4">
+                    <button onclick="openDnsModal('{dom}')" class="px-2.5 py-1 bg-purple-50 hover:bg-purple-100 text-[#6200ee] border border-purple-200 rounded text-xs font-bold transition">
+                        📋 View / Export DNS
+                    </button>
+                </td>
             </tr>"#,
             dom = dom,
             umail_path = umail_path,
@@ -215,6 +220,9 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             </div>
             <div class="flex items-center gap-3">
                 <a href="/umail" class="px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">Open uMail PWA (/umail)</a>
+                <button onclick="exportAllDns()" class="px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">
+                    📤 Export All DNS
+                </button>
                 <button onclick="document.getElementById('onboardModal').showModal()" class="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 rounded-lg text-sm font-bold shadow transition">
                     + Onboard New Client Domain
                 </button>
@@ -286,6 +294,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                             <th class="py-3 px-4">DKIM DNS Host</th>
                             <th class="py-3 px-4">DKIM Public TXT Value</th>
                             <th class="py-3 px-4">DNS Status</th>
+                            <th class="py-3 px-4">DNS Provisioning</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -421,7 +430,177 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
         </div>
     </dialog>
 
+    <!-- DNS Provisioning Modal -->
+    <dialog id="dnsModal" aria-labelledby="dnsTitle" class="rounded-2xl shadow-2xl p-0 w-full max-w-4xl backdrop:bg-slate-900/60">
+        <div class="p-6">
+            <div class="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
+                <div>
+                    <h2 id="dnsTitle" class="text-lg font-bold text-slate-900">DNS Provisioning Matrix &amp; Export</h2>
+                    <p id="dnsSubtitle" class="text-xs text-slate-500 font-mono">Loading records...</p>
+                </div>
+                <button onclick="document.getElementById('dnsModal').close()" class="text-slate-400 hover:text-slate-700 text-2xl">&times;</button>
+            </div>
+
+            <!-- Tab bar -->
+            <div class="flex gap-2 border-b border-slate-200 mb-4">
+                <button id="tabBtnTable" onclick="showDnsTab('table')" class="px-4 py-2 text-sm font-bold border-b-2 border-[#6200ee] text-[#6200ee]">📊 DNS Matrix Table</button>
+                <button id="tabBtnZone" onclick="showDnsTab('zone')" class="px-4 py-2 text-sm font-semibold text-slate-500 hover:text-slate-800">📄 BIND Zone File</button>
+                <button id="tabBtnCsv" onclick="showDnsTab('csv')" class="px-4 py-2 text-sm font-semibold text-slate-500 hover:text-slate-800">📋 Cloudflare CSV</button>
+            </div>
+
+            <div id="dnsTabTable" class="space-y-4">
+                <div class="overflow-x-auto border border-slate-200 rounded-xl">
+                    <table class="w-full text-left border-collapse text-xs">
+                        <thead class="bg-slate-50 text-slate-600 font-bold uppercase border-b border-slate-200">
+                            <tr>
+                                <th class="p-2.5">Type</th>
+                                <th class="p-2.5">Host / Name</th>
+                                <th class="p-2.5">Priority</th>
+                                <th class="p-2.5">Value / Content</th>
+                                <th class="p-2.5">Purpose</th>
+                                <th class="p-2.5">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="dnsTableBody" class="divide-y divide-slate-100 font-mono">
+                            <!-- Injected dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="dnsTabZone" class="hidden space-y-3">
+                <div class="flex justify-between items-center">
+                    <span class="text-xs text-slate-500">Standard RFC 1035 BIND Zone Format (Compatible with BIND, Route53, Namecheap, cPanel)</span>
+                    <div class="flex gap-2">
+                        <button onclick="copyDnsContent('dnsZoneContent')" class="px-3 py-1 bg-slate-100 hover:bg-slate-200 rounded text-xs font-bold text-slate-700">📋 Copy Zone</button>
+                        <button onclick="downloadDnsFile('zone')" class="px-3 py-1 bg-[#6200ee] hover:bg-purple-800 rounded text-xs font-bold text-white">💾 Download .zone</button>
+                    </div>
+                </div>
+                <textarea id="dnsZoneContent" readonly class="w-full h-72 font-mono text-xs p-3 bg-slate-900 text-emerald-400 rounded-xl resize-none"></textarea>
+            </div>
+
+            <div id="dnsTabCsv" class="hidden space-y-3">
+                <div class="flex justify-between items-center">
+                    <span class="text-xs text-slate-500">Cloudflare Dashboard DNS CSV Import (Cloudflare Dashboard -&gt; DNS -&gt; Records -&gt; Import)</span>
+                    <div class="flex gap-2">
+                        <button onclick="copyDnsContent('dnsCsvContent')" class="px-3 py-1 bg-slate-100 hover:bg-slate-200 rounded text-xs font-bold text-slate-700">📋 Copy CSV</button>
+                        <button onclick="downloadDnsFile('csv')" class="px-3 py-1 bg-[#6200ee] hover:bg-purple-800 rounded text-xs font-bold text-white">💾 Download .csv</button>
+                    </div>
+                </div>
+                <textarea id="dnsCsvContent" readonly class="w-full h-72 font-mono text-xs p-3 bg-slate-900 text-emerald-400 rounded-xl resize-none"></textarea>
+            </div>
+
+            <div class="flex justify-end gap-2 pt-4 border-t border-slate-100 mt-4">
+                <button type="button" onclick="document.getElementById('dnsModal').close()" class="px-4 py-2 border rounded-lg text-sm font-semibold">Close</button>
+            </div>
+        </div>
+    </dialog>
+
     <script>
+        let currentDomainDns = null;
+
+        async function openDnsModal(dom) {{
+            const modal = document.getElementById('dnsModal');
+            document.getElementById('dnsSubtitle').textContent = 'Fetching DNS bundle for ' + dom + '...';
+            modal.showModal();
+            showDnsTab('table');
+
+            try {{
+                const resp = await fetch('/api/v1/domains/' + dom + '/dns');
+                if (!resp.ok) throw new Error(await resp.text());
+                const data = await resp.json();
+                currentDomainDns = data;
+                document.getElementById('dnsSubtitle').textContent = 'Domain: ' + dom + ' • Tenant: ' + data.tenant_id;
+
+                const tbody = document.getElementById('dnsTableBody');
+                tbody.innerHTML = '';
+                for (const rec of data.bundle.records) {{
+                    const tr = document.createElement('tr');
+                    tr.className = 'hover:bg-slate-50/70';
+                    const prioText = rec.priority !== null && rec.priority !== undefined ? rec.priority : '-';
+                    const valClean = (rec.value || '').replace(/'/g, "\\'");
+                    tr.innerHTML = 
+                        '<td class="p-2.5"><span class="px-1.5 py-0.5 rounded font-bold bg-slate-100 text-slate-800">' + rec.record_type + '</span></td>' +
+                        '<td class="p-2.5 font-bold text-purple-900">' + rec.host + '</td>' +
+                        '<td class="p-2.5 text-slate-600">' + prioText + '</td>' +
+                        '<td class="p-2.5 max-w-xs truncate text-slate-700" title="' + valClean + '">' + rec.value + '</td>' +
+                        '<td class="p-2.5 text-slate-500 font-sans text-xs">' + rec.purpose + '</td>' +
+                        '<td class="p-2.5">' +
+                            '<button onclick="navigator.clipboard.writeText(\'' + valClean + '\'); alert(\'Copied value to clipboard!\');" class="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-semibold">Copy</button>' +
+                        '</td>';
+                    tbody.appendChild(tr);
+                }}
+
+                document.getElementById('dnsZoneContent').value = data.bind_zone;
+                document.getElementById('dnsCsvContent').value = data.cloudflare_csv;
+            }} catch (err) {{
+                document.getElementById('dnsSubtitle').textContent = 'Error loading DNS: ' + err.message;
+            }}
+        }}
+
+        function showDnsTab(tab) {{
+            const tabs = ['table', 'zone', 'csv'];
+            for (const t of tabs) {{
+                const cap = t.charAt(0).toUpperCase() + t.slice(1);
+                const el = document.getElementById('dnsTab' + cap);
+                const btn = document.getElementById('tabBtn' + cap);
+                if (t === tab) {{
+                    el.classList.remove('hidden');
+                    btn.className = 'px-4 py-2 text-sm font-bold border-b-2 border-[#6200ee] text-[#6200ee]';
+                }} else {{
+                    el.classList.add('hidden');
+                    btn.className = 'px-4 py-2 text-sm font-semibold text-slate-500 hover:text-slate-800';
+                }}
+            }}
+        }}
+
+        function copyDnsContent(elementId) {{
+            const val = document.getElementById(elementId).value;
+            navigator.clipboard.writeText(val);
+            alert('Copied to clipboard!');
+        }}
+
+        function downloadDnsFile(format) {{
+            if (!currentDomainDns) return;
+            const dom = currentDomainDns.domain;
+            const content = format === 'zone' ? currentDomainDns.bind_zone : currentDomainDns.cloudflare_csv;
+            const filename = format === 'zone' ? dom + '.zone' : dom + '-cloudflare-dns.csv';
+            const mime = format === 'zone' ? 'text/plain' : 'text/csv';
+
+            const blob = new Blob([content], {{ type: mime }});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }}
+
+        async function exportAllDns() {{
+            try {{
+                const resp = await fetch('/api/v1/admin/dns/export-all', {{
+                    headers: {{ 'X-API-Key': '{master_key}' }}
+                }});
+                if (!resp.ok) throw new Error(await resp.text());
+                const data = await resp.json();
+
+                const blob = new Blob([data.combined_bind_zone], {{ type: 'text/plain' }});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'kaposong-all-domains-' + new Date().toISOString().slice(0, 10) + '.zone';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                alert('Exported DNS bundles for ' + data.count + ' domain(s)!');
+            }} catch (err) {{
+                alert('Export error: ' + err.message);
+            }}
+        }}
+
         async function submitOnboard(e) {{
             e.preventDefault();
             const f = e.target;

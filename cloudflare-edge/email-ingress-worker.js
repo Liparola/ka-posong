@@ -112,23 +112,79 @@ export default {
       );
     }
 
-    // Strategy A: Cloudflare Native `send_email` Binding (`env.SEND_EMAIL`)
-    if (env.SEND_EMAIL && typeof env.SEND_EMAIL.send === "function") {
+    // Strategy A: Cloudflare Email Sending Service Binding (env.EMAIL or env.SEND_EMAIL)
+    const emailBinding = env.EMAIL || env.SEND_EMAIL;
+    if (emailBinding && typeof emailBinding.send === "function") {
+      // 1. Try structured object first (Cloudflare Email Sending Beta API)
       try {
-        const msg = new EmailMessage(from, to, raw_mime);
-        await env.SEND_EMAIL.send(msg);
+        const sendOpts = {
+          from,
+          to,
+          subject: subject || "(No Subject)",
+          text: body_text || "",
+        };
+        if (body_html) sendOpts.html = body_html;
+
+        const res = await emailBinding.send(sendOpts);
         return Response.json({
           status: "DISPATCHED",
-          provider: "cloudflare-send-email-binding",
+          provider: "cloudflare-email-sending-binding",
+          messageId: res?.messageId || res?.id || "cf-sent",
           from,
           to,
         });
-      } catch (cfErr) {
-        return Response.json(
-          { error: `Cloudflare SEND_EMAIL error: ${cfErr.message || String(cfErr)}` },
-          { status: 502 }
-        );
+      } catch (structuredErr) {
+        // 2. Fallback to raw EmailMessage
+        try {
+          const msg = new EmailMessage(from, to, raw_mime);
+          await emailBinding.send(msg);
+          return Response.json({
+            status: "DISPATCHED",
+            provider: "cloudflare-send-email-mime-binding",
+            from,
+            to,
+          });
+        } catch (cfErr) {
+          return Response.json(
+            {
+              error: `Cloudflare Email Binding failed: ${cfErr.message || String(cfErr)}`,
+              structuredError: structuredErr.message || String(structuredErr),
+            },
+            { status: 502 }
+          );
+        }
       }
+    }
+
+    // Strategy B: Cloudflare Email Sending REST API (env.CLOUDFLARE_API_TOKEN)
+    if (env.CLOUDFLARE_API_TOKEN) {
+      const accountId = env.CLOUDFLARE_ACCOUNT_ID || "5d34290efd0db9537a45b9bb167f6e7f";
+      const cfResp = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${accountId}/email/sending`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            from,
+            to,
+            subject: subject || "(No Subject)",
+            text: body_text || "",
+            html: body_html || undefined,
+          }),
+        }
+      );
+      const cfData = await cfResp.json().catch(() => ({}));
+      if (cfResp.ok && cfData.success !== false) {
+        return Response.json({
+          status: "DISPATCHED",
+          provider: "cloudflare-email-sending-rest-api",
+          ...cfData,
+        });
+      }
+      return Response.json({ error: cfData }, { status: cfResp.status || 502 });
     }
 
     // Strategy B: Resend HTTPS API (`env.RESEND_API_KEY`)

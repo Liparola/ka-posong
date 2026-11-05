@@ -205,8 +205,22 @@ export class AppShell extends LitElement {
     router.resolveRoute();
 
     this.addEventListener('open-compose', (e: Event) => {
-      const detail = (e as CustomEvent<{ to?: string; subject?: string }>).detail;
-      this._composeModal?.open(detail?.to ?? '', detail?.subject ?? '');
+      const detail = (
+        e as CustomEvent<{
+          to?: string;
+          subject?: string;
+          body?: string;
+          inReplyTo?: string;
+          threadId?: string;
+        }>
+      ).detail;
+      this._composeModal?.open(
+        detail?.to ?? '',
+        detail?.subject ?? '',
+        detail?.body ?? '',
+        detail?.inReplyTo ?? '',
+        detail?.threadId ?? ''
+      );
     });
 
     setTimeout(() => {

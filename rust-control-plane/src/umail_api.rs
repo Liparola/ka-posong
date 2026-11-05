@@ -40,6 +40,8 @@ pub struct MailMessageDto {
     pub is_starred: bool,
     pub spf_dmarc_status: String,
     pub received_at: String,
+    pub in_reply_to: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +50,8 @@ pub struct SendMailPayload {
     pub subject: String,
     pub body_text: String,
     pub body_html: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,7 +97,7 @@ pub async fn list_umail_messages(
         let pattern = format!("%{}%", search);
         sqlx::query(
             r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                      is_read, is_starred, spf_dmarc_status, received_at
+                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
                FROM mail_messages
                WHERE mailbox_email = ? AND (subject LIKE ? OR sender_email LIKE ? OR body_text LIKE ?)
                ORDER BY received_at DESC LIMIT 100"#,
@@ -107,7 +111,7 @@ pub async fn list_umail_messages(
     } else if folder == "starred" {
         sqlx::query(
             r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                      is_read, is_starred, spf_dmarc_status, received_at
+                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
                FROM mail_messages
                WHERE mailbox_email = ? AND is_starred = 1
                ORDER BY received_at DESC LIMIT 100"#,
@@ -118,7 +122,7 @@ pub async fn list_umail_messages(
     } else {
         sqlx::query(
             r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                      is_read, is_starred, spf_dmarc_status, received_at
+                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
                FROM mail_messages
                WHERE mailbox_email = ? AND folder = ?
                ORDER BY received_at DESC LIMIT 100"#,
@@ -151,6 +155,8 @@ pub async fn list_umail_messages(
             is_starred: r.get::<i64, _>("is_starred") == 1,
             spf_dmarc_status: r.get("spf_dmarc_status"),
             received_at: r.get("received_at"),
+            in_reply_to: r.try_get("in_reply_to").ok(),
+            thread_id: r.try_get("thread_id").ok(),
         })
         .collect();
 
@@ -159,6 +165,65 @@ pub async fn list_umail_messages(
         "phone": claims.phone,
         "domain": claims.domain,
         "folder": folder,
+        "messages": messages
+    })))
+}
+
+/// GET /api/umail/thread/:thread_id
+/// Returns all messages (inbox & sent) in the same conversation thread
+pub async fn get_umail_thread(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(thread_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+
+    let rows = sqlx::query(
+        r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
+                  is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
+           FROM mail_messages
+           WHERE (mailbox_email = ? OR sender_email = ?)
+             AND (thread_id = ? OR id = ? OR in_reply_to = ?)
+           ORDER BY received_at ASC LIMIT 100"#,
+    )
+    .bind(&claims.email)
+    .bind(&claims.email)
+    .bind(&thread_id)
+    .bind(&thread_id)
+    .bind(&thread_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let messages: Vec<MailMessageDto> = rows
+        .into_iter()
+        .map(|r| MailMessageDto {
+            id: r.get("id"),
+            folder: r.get("folder"),
+            sender_name: r.get("sender_name"),
+            sender_email: r.get("sender_email"),
+            recipient_email: r.get("recipient_email"),
+            subject: r.get("subject"),
+            preview: r.get("preview"),
+            body_text: r.get("body_text"),
+            body_html: r.get("body_html"),
+            is_read: r.get::<i64, _>("is_read") == 1,
+            is_starred: r.get::<i64, _>("is_starred") == 1,
+            spf_dmarc_status: r.get("spf_dmarc_status"),
+            received_at: r.get("received_at"),
+            in_reply_to: r.try_get("in_reply_to").ok(),
+            thread_id: r.try_get("thread_id").ok(),
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "thread_id": thread_id,
+        "count": messages.len(),
         "messages": messages
     })))
 }
@@ -182,8 +247,36 @@ pub async fn send_umail_message(
     let now_rfc2822 = chrono::Utc::now().to_rfc2822();
     let preview: String = payload.body_text.chars().take(120).collect();
 
+    // Derive or resolve conversation thread_id
+    let thread_id = if let Some(ref tid) = payload.thread_id {
+        if !tid.trim().is_empty() {
+            tid.trim().to_string()
+        } else {
+            msg_id.clone()
+        }
+    } else if let Some(ref ir) = payload.in_reply_to {
+        let parent_tid: Option<String> = sqlx::query_scalar(
+            "SELECT thread_id FROM mail_messages WHERE id = ? OR in_reply_to = ? LIMIT 1",
+        )
+        .bind(ir)
+        .bind(ir)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        parent_tid.unwrap_or_else(|| ir.clone())
+    } else {
+        msg_id.clone()
+    };
+
+    let in_reply_to_clean = payload.in_reply_to.as_ref().map(|s| s.trim().to_string());
+    let mut thread_headers = String::new();
+    if let Some(ref ir) = in_reply_to_clean {
+        thread_headers.push_str(&format!("In-Reply-To: <{}>\r\nReferences: <{}>\r\n", ir, ir));
+    }
+
     let raw_mime = format!(
-        "From: {} <{}>\r\nTo: <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
+        "From: {} <{}>\r\nTo: <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\n{}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
         claims.name,
         claims.email,
         recipient,
@@ -191,14 +284,15 @@ pub async fn send_umail_message(
         now_rfc2822,
         msg_id,
         claims.domain,
+        thread_headers,
         payload.body_text
     );
 
     // 1. Store in sender's 'sent' folder
     sqlx::query(
         r#"INSERT INTO mail_messages
-           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status)
-           VALUES (?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'DKIM-SIGNED')"#,
+           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id)
+           VALUES (?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'DKIM-SIGNED', ?, ?)"#,
     )
     .bind(&msg_id)
     .bind(&claims.client_id)
@@ -211,6 +305,8 @@ pub async fn send_umail_message(
     .bind(&payload.body_text)
     .bind(&payload.body_html)
     .bind(&raw_mime)
+    .bind(&in_reply_to_clean)
+    .bind(&thread_id)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -233,8 +329,8 @@ pub async fn send_umail_message(
         let inbox_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let _ = sqlx::query(
             r#"INSERT INTO mail_messages
-               (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status)
-               VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Internal DKIM)')"#,
+               (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id)
+               VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Internal DKIM)', ?, ?)"#,
         )
         .bind(&inbox_id)
         .bind(&rcpt_tid)
@@ -247,6 +343,8 @@ pub async fn send_umail_message(
         .bind(&payload.body_text)
         .bind(&payload.body_html)
         .bind(&raw_mime)
+        .bind(&in_reply_to_clean)
+        .bind(&thread_id)
         .execute(&state.db)
         .await;
     }

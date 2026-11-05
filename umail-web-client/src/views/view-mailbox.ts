@@ -1,11 +1,13 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { mailService } from '../services/mail';
+import { mailService, type MailMessage } from '../services/mail';
 import { authService } from '../services/auth';
 import {
   normalizeMailMessage,
   safeSetEmailHTML,
+  groupMessagesIntoThreads,
   type NormalizedMailMessage,
+  type EmailThread,
 } from '../utils/mime-renderer';
 
 type RenderMode = 'rich' | 'plain' | 'meta';
@@ -13,11 +15,19 @@ type RenderMode = 'rich' | 'plain' | 'meta';
 @customElement('view-mailbox')
 export class ViewMailbox extends LitElement {
   @property({ type: String }) folder = 'inbox';
-  @state() private messages: NormalizedMailMessage[] = [];
-  @state() private selectedMessage: NormalizedMailMessage | null = null;
+  @state() private rawMessages: NormalizedMailMessage[] = [];
+  @state() private threads: EmailThread[] = [];
+  @state() private selectedThread: EmailThread | null = null;
+  @state() private expandedMessageIds: Set<string> = new Set();
   @state() private searchQuery = '';
   @state() private loading = true;
   @state() private renderMode: RenderMode = 'rich';
+
+  // Inline Quick Reply State
+  @state() private inlineReplyText = '';
+  @state() private inlineReplySending = false;
+  @state() private inlineReplyNotice = '';
+  @state() private inlineReplyError = '';
 
   private _mailUpdateHandler!: () => void;
 
@@ -100,6 +110,9 @@ export class ViewMailbox extends LitElement {
       font-size: 0.83rem;
       cursor: pointer;
       transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
 
     .btn-action:hover {
@@ -152,6 +165,7 @@ export class ViewMailbox extends LitElement {
     .msg-row.unread {
       border-left-color: #6200ee;
       background: #fdfcff;
+      font-weight: 600;
     }
 
     .msg-row.active {
@@ -194,6 +208,29 @@ export class ViewMailbox extends LitElement {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .thread-pill {
+      background: #eee8fc;
+      color: #6200ee;
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 12px;
+      flex-shrink: 0;
+    }
+
+    .replied-tag {
+      background: #e8f5e9;
+      color: #2e7d32;
+      font-size: 0.68rem;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 4px;
+      flex-shrink: 0;
     }
 
     .date {
@@ -230,27 +267,111 @@ export class ViewMailbox extends LitElement {
       border: 1px solid #eee;
       display: flex;
       flex-direction: column;
+      gap: 16px;
     }
 
-    .reader-header {
+    .thread-header {
       border-bottom: 1px solid #eee;
-      padding-bottom: 16px;
-      margin-bottom: 18px;
+      padding-bottom: 14px;
     }
 
-    .reader-subject-row {
+    .thread-title-row {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
       gap: 12px;
-      margin-bottom: 12px;
+      margin-bottom: 8px;
     }
 
-    .reader-header h2 {
+    .thread-title-row h2 {
       margin: 0;
-      font-size: 1.28rem;
+      font-size: 1.32rem;
       color: #1a1a2e;
       line-height: 1.35;
+    }
+
+    .thread-meta-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .thread-tag {
+      background: #f0e6ff;
+      color: #6200ee;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+    }
+
+    .spf-badge {
+      background: #e8f5e9;
+      color: #2e7d32;
+      font-weight: 700;
+      font-size: 0.74rem;
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid #c8e6c9;
+      white-space: nowrap;
+    }
+
+    /* Conversation Stream & Message Cards */
+    .conversation-stream {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .msg-card {
+      border: 1px solid #ececf4;
+      border-radius: 10px;
+      background: #fff;
+      overflow: hidden;
+      transition: all 0.15s ease;
+    }
+
+    .msg-card-collapsed {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      background: #fbfbfe;
+      cursor: pointer;
+    }
+
+    .msg-card-collapsed:hover {
+      background: #f4f0ff;
+    }
+
+    .msg-card-collapsed .sender-name {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: #2c2c3e;
+      width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .msg-card-collapsed .collapsed-snippet {
+      flex: 1;
+      font-size: 0.82rem;
+      color: #666;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .msg-card-collapsed .collapsed-date {
+      font-size: 0.75rem;
+      color: #888;
+      white-space: nowrap;
+    }
+
+    .msg-card-expanded {
+      padding: 18px 20px;
     }
 
     .sender-card {
@@ -263,6 +384,7 @@ export class ViewMailbox extends LitElement {
       border: 1px solid #ece3ff;
       border-radius: 10px;
       padding: 12px 14px;
+      margin-bottom: 12px;
     }
 
     .sender-card-left {
@@ -289,17 +411,6 @@ export class ViewMailbox extends LitElement {
       background: #f0e6ff;
       padding: 1px 6px;
       border-radius: 4px;
-    }
-
-    .spf-badge {
-      background: #e8f5e9;
-      color: #2e7d32;
-      font-weight: 700;
-      font-size: 0.74rem;
-      padding: 4px 10px;
-      border-radius: 6px;
-      border: 1px solid #c8e6c9;
-      white-space: nowrap;
     }
 
     .meta-drawer {
@@ -355,7 +466,7 @@ export class ViewMailbox extends LitElement {
       justify-content: space-between;
       align-items: center;
       gap: 10px;
-      margin-top: 12px;
+      margin: 12px 0;
     }
 
     .reader-actions,
@@ -387,21 +498,6 @@ export class ViewMailbox extends LitElement {
       border-radius: 0 6px 6px 0;
     }
 
-    .reader-body-rich hr {
-      border: none;
-      border-top: 1px solid #e5e0f0;
-      margin: 16px 0;
-    }
-
-    .reader-body-rich pre,
-    .reader-body-rich code {
-      background: #f5f2fa;
-      border-radius: 4px;
-      padding: 2px 5px;
-      font-family: monospace;
-      font-size: 0.86rem;
-    }
-
     .reader-body-plain {
       white-space: pre-wrap;
       line-height: 1.65;
@@ -415,23 +511,81 @@ export class ViewMailbox extends LitElement {
       flex: 1;
     }
 
-    .meta-table {
+    /* Inline Quick Reply Drawer (Gmail / Outlook Standard UX) */
+    .inline-reply-box {
+      margin-top: 18px;
+      background: #faf9fe;
+      border: 1.5px solid #dcd5f2;
+      border-radius: 12px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .reply-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: #444;
+    }
+
+    .reply-header strong {
+      color: #6200ee;
+    }
+
+    .inline-reply-box textarea {
       width: 100%;
-      border-collapse: collapse;
-      margin-top: 8px;
-      font-size: 0.82rem;
+      min-height: 90px;
+      padding: 12px;
+      border: 1px solid #d0c8ea;
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 0.94rem;
+      line-height: 1.5;
+      outline: none;
+      box-sizing: border-box;
+      resize: vertical;
+      background: #fff;
     }
 
-    .meta-table th,
-    .meta-table td {
-      padding: 8px 10px;
-      border: 1px solid #e6e4f0;
-      text-align: left;
+    .inline-reply-box textarea:focus {
+      border-color: #6200ee;
+      box-shadow: 0 0 0 2px rgba(98, 0, 238, 0.12);
     }
 
-    .meta-table th {
-      background: #f4f0ff;
-      color: #3700b3;
+    .reply-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .btn-send-reply {
+      padding: 9px 20px;
+      border: none;
+      background: #6200ee;
+      color: #fff;
+      font-weight: 700;
+      font-size: 0.88rem;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .btn-send-reply:hover {
+      background: #4b00b5;
+    }
+
+    .btn-send-reply:disabled {
+      background: #bbb;
+      cursor: not-allowed;
     }
 
     .empty-state {
@@ -455,68 +609,136 @@ export class ViewMailbox extends LitElement {
 
   updated(changed: Map<string, unknown>) {
     if (changed.has('folder')) {
-      this.selectedMessage = null;
+      this.selectedThread = null;
       this.loadFolder();
     }
-    this._syncSanitizedRichBody();
+    this._syncAllRichBodies();
   }
 
-  private _syncSanitizedRichBody() {
-    if (!this.selectedMessage || this.renderMode !== 'rich') return;
-    const container = this.renderRoot.querySelector('.reader-body-rich') as HTMLElement | null;
-    if (container) {
-      safeSetEmailHTML(container, this.selectedMessage.cleanHtml);
-    }
+  private _syncAllRichBodies() {
+    if (!this.selectedThread || this.renderMode !== 'rich') return;
+    const containers = this.renderRoot.querySelectorAll('.reader-body-rich[data-msg-id]');
+    containers.forEach((container) => {
+      const id = container.getAttribute('data-msg-id');
+      const m = this.selectedThread?.messages.find((x) => x.id === id);
+      if (m && container instanceof HTMLElement) {
+        safeSetEmailHTML(container, m.cleanHtml);
+      }
+    });
   }
 
   async loadFolder() {
     this.loading = true;
     try {
-      const rawMessages = await mailService.fetchMessages(this.folder, this.searchQuery);
-      this.messages = rawMessages.map((m) => normalizeMailMessage(m));
-      if (this.messages.length > 0) {
-        const currentId = this.selectedMessage?.id;
-        this.selectedMessage =
-          this.messages.find((m) => m.id === currentId) ?? this.messages[0];
+      const user = authService.getUser();
+      const rawCurrent = await mailService.fetchMessages(this.folder, this.searchQuery);
+      let allRaw: MailMessage[] = [...rawCurrent];
+
+      // To assemble comprehensive conversation threads (like Gmail / Outlook),
+      // also fetch sent messages if in inbox, or inbox if in sent
+      if (!this.searchQuery) {
+        if (this.folder === 'inbox') {
+          const sent = await mailService.fetchMessages('sent').catch(() => []);
+          allRaw.push(...sent);
+        } else if (this.folder === 'sent') {
+          const inbox = await mailService.fetchMessages('inbox').catch(() => []);
+          allRaw.push(...inbox);
+        }
+      }
+
+      // Deduplicate by message ID
+      const seenIds = new Set<string>();
+      const deduped: MailMessage[] = [];
+      for (const m of allRaw) {
+        if (!seenIds.has(m.id)) {
+          seenIds.add(m.id);
+          deduped.push(m);
+        }
+      }
+
+      this.rawMessages = deduped.map((m) => normalizeMailMessage(m));
+      this.threads = groupMessagesIntoThreads(this.rawMessages, user?.email ?? '');
+
+      if (this.threads.length > 0) {
+        const currentThreadKey = this.selectedThread?.threadKey;
+        this.selectedThread =
+          this.threads.find((t) => t.threadKey === currentThreadKey) ?? this.threads[0];
+        // Expand the latest message by default
+        this.expandedMessageIds = new Set([this.selectedThread.latestMessage.id]);
       } else {
-        this.selectedMessage = null;
+        this.selectedThread = null;
+        this.expandedMessageIds = new Set();
       }
     } catch {
-      this.messages = [];
+      this.threads = [];
+      this.selectedThread = null;
     } finally {
       this.loading = false;
     }
   }
 
-  private async _selectMessage(msg: NormalizedMailMessage) {
-    this.selectedMessage = msg;
-    if (!msg.is_read) {
-      msg.is_read = true;
-      this.requestUpdate();
-      await mailService.updateMessage(msg.id, { is_read: true });
+  private async _selectThread(thread: EmailThread) {
+    this.selectedThread = thread;
+    this.inlineReplyText = '';
+    this.inlineReplyNotice = '';
+    this.inlineReplyError = '';
+    this.expandedMessageIds = new Set([thread.latestMessage.id]);
+
+    // Mark unread messages in this thread as read
+    for (const m of thread.messages) {
+      if (!m.is_read) {
+        m.is_read = true;
+        await mailService.updateMessage(m.id, { is_read: true });
+      }
     }
-  }
-
-  private async _toggleStar(msg: NormalizedMailMessage, e: Event) {
-    e.stopPropagation();
-    const next = !msg.is_starred;
-    msg.is_starred = next;
+    thread.unreadCount = 0;
     this.requestUpdate();
-    await mailService.updateMessage(msg.id, { is_starred: next });
   }
 
-  private async _moveFolder(msg: NormalizedMailMessage, targetFolder: string) {
-    await mailService.updateMessage(msg.id, { folder: targetFolder });
-    this.selectedMessage = null;
+  private _toggleMessageExpansion(msgId: string) {
+    if (this.expandedMessageIds.has(msgId)) {
+      this.expandedMessageIds.delete(msgId);
+    } else {
+      this.expandedMessageIds.add(msgId);
+    }
+    this.requestUpdate();
+  }
+
+  private async _toggleStar(thread: EmailThread, e: Event) {
+    e.stopPropagation();
+    const next = !thread.isStarred;
+    thread.isStarred = next;
+    for (const m of thread.messages) {
+      m.is_starred = next;
+      await mailService.updateMessage(m.id, { is_starred: next });
+    }
+    this.requestUpdate();
+  }
+
+  private async _moveThreadFolder(thread: EmailThread, targetFolder: string) {
+    for (const m of thread.messages) {
+      await mailService.updateMessage(m.id, { folder: targetFolder });
+    }
+    this.selectedThread = null;
     await this.loadFolder();
   }
 
-  private _reply(msg: NormalizedMailMessage) {
+  private _openFullComposeForReply(thread: EmailThread) {
+    const user = authService.getUser();
+    const latest = thread.latestMessage;
+    const isLatestFromSelf = user && latest.senderAddress.toLowerCase() === user.email.toLowerCase();
+    const to = isLatestFromSelf ? latest.recipient_email : latest.senderAddress;
+    const cleanSubj = thread.cleanSubject;
+    const subject = cleanSubj.toLowerCase().startsWith('re:') ? cleanSubj : `Re: ${cleanSubj}`;
+
     this.dispatchEvent(
       new CustomEvent('open-compose', {
         detail: {
-          to: msg.senderAddress,
-          subject: msg.subject.startsWith('Re:') ? msg.subject : `Re: ${msg.subject}`,
+          to,
+          subject,
+          body: this.inlineReplyText,
+          inReplyTo: latest.id,
+          threadId: thread.threadKey.replace(/^tid_/, '').replace(/^subj_/, ''),
         },
         bubbles: true,
         composed: true,
@@ -524,9 +746,59 @@ export class ViewMailbox extends LitElement {
     );
   }
 
+  private async _sendInlineReply() {
+    if (!this.selectedThread) return;
+    const text = this.inlineReplyText.trim();
+    if (!text) {
+      this.inlineReplyError = 'Please write a message before sending.';
+      return;
+    }
+
+    const user = authService.getUser();
+    const latest = this.selectedThread.latestMessage;
+    const isLatestFromSelf = user && latest.senderAddress.toLowerCase() === user.email.toLowerCase();
+    const to = isLatestFromSelf ? latest.recipient_email : latest.senderAddress;
+    const cleanSubj = this.selectedThread.cleanSubject;
+    const subject = cleanSubj.toLowerCase().startsWith('re:') ? cleanSubj : `Re: ${cleanSubj}`;
+
+    this.inlineReplySending = true;
+    this.inlineReplyError = '';
+    this.inlineReplyNotice = '';
+
+    try {
+      const res = await mailService.sendMessage(
+        to,
+        subject,
+        text,
+        undefined,
+        latest.id,
+        this.selectedThread.threadKey.replace(/^tid_/, '').replace(/^subj_/, '')
+      );
+      this.inlineReplyText = '';
+      this.inlineReplyNotice = `Dispatched via ${res.delivery_provider ?? 'Cloudflare Email Service'}`;
+      await this.loadFolder();
+    } catch (err: unknown) {
+      this.inlineReplyError = err instanceof Error ? err.message : 'Failed to send reply';
+    } finally {
+      this.inlineReplySending = false;
+    }
+  }
+
+  private _quoteOriginalText() {
+    if (!this.selectedThread) return;
+    const latest = this.selectedThread.latestMessage;
+    const quoted = latest.cleanText
+      .split('\n')
+      .map((l) => `> ${l}`)
+      .join('\n');
+    const header = `\n\nOn ${latest.formattedDateFull}, ${latest.senderDisplayName} wrote:\n`;
+    this.inlineReplyText = (this.inlineReplyText + header + quoted).trim();
+    this.requestUpdate();
+  }
+
   render() {
     const user = authService.getUser();
-    const msg = this.selectedMessage;
+    const thread = this.selectedThread;
 
     return html`
       <div class="org-banner">
@@ -534,7 +806,7 @@ export class ViewMailbox extends LitElement {
           <h3>${user?.email ?? 'uMail Inbox'}</h3>
           <small>
             UMANG Phone ID: ${user?.phone ?? ''} • Domain: ${user?.domain ?? 'liparola.org'} •
-            Stalwart JMAP/SMTP Connected
+            Cloudflare Email Routing &amp; Sending (Beta)
           </small>
         </div>
         <span class="plan-badge">${user?.subscription ?? 'ENTERPRISE'} TIER</span>
@@ -544,7 +816,7 @@ export class ViewMailbox extends LitElement {
         <div class="search-box">
           <input
             type="search"
-            placeholder="Search messages in ${this.folder}..."
+            placeholder="Search conversations in ${this.folder}..."
             .value=${this.searchQuery}
             @input=${(e: Event) => {
               this.searchQuery = (e.target as HTMLInputElement).value;
@@ -556,165 +828,233 @@ export class ViewMailbox extends LitElement {
       </div>
 
       <div class="split-pane">
+        <!-- Thread Conversation List Pane -->
         <div class="message-list">
           ${this.loading
-            ? html`<div class="empty-state">Syncing ${this.folder} with Stalwart...</div>`
-            : this.messages.length === 0
-            ? html`<div class="empty-state">No messages in <strong>${this.folder}</strong>.</div>`
-            : this.messages.map(
-                (m) => html`
+            ? html`<div class="empty-state">Syncing conversations with Cloudflare &amp; Stalwart...</div>`
+            : this.threads.length === 0
+            ? html`<div class="empty-state">No conversations in <strong>${this.folder}</strong>.</div>`
+            : this.threads.map((t) => {
+                const latest = t.latestMessage;
+                const isSelected = thread?.threadKey === t.threadKey;
+                return html`
                   <div
-                    class="msg-row ${!m.is_read ? 'unread' : ''} ${msg?.id === m.id ? 'active' : ''}"
-                    @click=${() => this._selectMessage(m)}>
-                    <div class="avatar-circle">${m.senderInitials}</div>
+                    class="msg-row ${t.unreadCount > 0 ? 'unread' : ''} ${isSelected ? 'active' : ''}"
+                    @click=${() => this._selectThread(t)}>
+                    <div class="avatar-circle">${latest.senderInitials}</div>
                     <div class="msg-content">
                       <div class="msg-top">
                         <span class="sender">
                           <span
-                            @click=${(e: Event) => this._toggleStar(m, e)}
-                            style="color:${m.is_starred ? '#f59e0b' : '#ccc'}; margin-right:5px;">
+                            @click=${(e: Event) => this._toggleStar(t, e)}
+                            style="color:${t.isStarred ? '#f59e0b' : '#ccc'}; cursor: pointer;">
                             ★
                           </span>
-                          ${this.folder === 'sent' ? `To: ${m.recipient_email}` : m.senderDisplayName}
+                          ${t.participantsSummary}
+                          ${t.hasReplies
+                            ? html`<span class="thread-pill">🧵 ${t.messages.length}</span>`
+                            : ''}
+                          ${t.participants.some((p) => p.isSelf)
+                            ? html`<span class="replied-tag">↩ Replied</span>`
+                            : ''}
                         </span>
-                        <span class="date">${m.formattedDateShort}</span>
+                        <span class="date">${t.lastDateShort}</span>
                       </div>
-                      <div class="subject">${m.subject}</div>
-                      <div class="preview">${m.cleanPreview}</div>
+                      <div class="subject">${t.cleanSubject}</div>
+                      <div class="preview">${latest.cleanPreview}</div>
                     </div>
                   </div>
-                `
-              )}
+                `;
+              })}
         </div>
 
+        <!-- Conversation Reader Pane -->
         <div class="reader-pane">
-          ${msg
+          ${thread
             ? html`
-                <div class="reader-header">
-                  <div class="reader-subject-row">
-                    <h2>${msg.subject}</h2>
-                    <span class="spf-badge">✓ ${msg.spf_dmarc_status}</span>
+                <div class="thread-header">
+                  <div class="thread-title-row">
+                    <h2>${thread.cleanSubject}</h2>
+                    <span class="spf-badge">✓ ${thread.latestMessage.spf_dmarc_status}</span>
                   </div>
-
-                  <div class="sender-card">
-                    <div class="sender-card-left">
-                      <div class="avatar-circle">${msg.senderInitials}</div>
-                      <div class="sender-meta">
-                        <div>
-                          <strong>${msg.senderDisplayName}</strong>
-                          <span class="email-pill">&lt;${msg.senderAddress}&gt;</span>
-                        </div>
-                        <div>
-                          <strong>To:</strong>
-                          <span class="email-pill">${msg.recipient_email}</span>
-                          • <span>${msg.formattedDateFull}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <details class="meta-drawer">
-                    <summary>🔐 Security, Authentication &amp; MIME Envelope Metadata</summary>
-                    <div class="meta-grid">
-                      <span class="meta-label">Message ID:</span>
-                      <span><code>${msg.id}</code></span>
-                      <span class="meta-label">Sender Domain:</span>
-                      <span><code>${msg.senderDomain}</code></span>
-                      <span class="meta-label">Authentication:</span>
-                      <div class="security-pills">
-                        ${msg.securityBadges.map(
-                          (b) => html`<span class="sec-pill">✓ ${b.label}</span>`
-                        )}
-                      </div>
-                      <span class="meta-label">MIME Structure:</span>
-                      <span>
-                        ${msg.mimeBoundary
-                          ? html`Multipart (boundary: <code>${msg.mimeBoundary}</code>)`
-                          : html`Standard RFC 5322 (${msg.mimeParts.length} part)`}
-                      </span>
-                    </div>
-                  </details>
-
-                  <div class="reader-toolbar">
-                    <div class="reader-actions">
-                      <button class="btn-action" @click=${() => this._reply(msg)}>
-                        ↩ Reply
-                      </button>
-                      <button
-                        class="btn-action"
-                        @click=${() => this._moveFolder(msg, 'archive')}>
-                        📥 Archive
-                      </button>
-                      <button class="btn-action" @click=${() => this._moveFolder(msg, 'trash')}>
-                        🗑 Trash
-                      </button>
-                    </div>
-
-                    <div class="render-mode-tabs">
-                      <button
-                        class="btn-action ${this.renderMode === 'rich' ? 'active' : ''}"
-                        @click=${() => {
-                          this.renderMode = 'rich';
-                        }}>
-                        ✨ Rich View
-                      </button>
-                      <button
-                        class="btn-action ${this.renderMode === 'plain' ? 'active' : ''}"
-                        @click=${() => {
-                          this.renderMode = 'plain';
-                        }}>
-                        📄 Plain Text
-                      </button>
-                      <button
-                        class="btn-action ${this.renderMode === 'meta' ? 'active' : ''}"
-                        @click=${() => {
-                          this.renderMode = 'meta';
-                        }}>
-                        🔍 MIME Inspector
-                      </button>
-                    </div>
+                  <div class="thread-meta-bar">
+                    <span class="thread-tag">🧵 ${thread.messages.length} messages in conversation</span>
+                    <span class="thread-tag">Cloudflare Verified Domain</span>
+                    <button class="btn-action" style="padding: 2px 8px; font-size: 0.75rem;" @click=${() => this._moveThreadFolder(thread, 'archive')}>
+                      📥 Archive
+                    </button>
+                    <button class="btn-action" style="padding: 2px 8px; font-size: 0.75rem;" @click=${() => this._moveThreadFolder(thread, 'trash')}>
+                      🗑 Trash
+                    </button>
                   </div>
                 </div>
 
-                ${this.renderMode === 'rich'
-                  ? html`<div class="reader-body-rich"></div>`
-                  : this.renderMode === 'plain'
-                  ? html`<div class="reader-body-plain">${msg.cleanText}</div>`
-                  : html`
-                      <div class="reader-body-plain">
-                        <strong>Parsed MIME Parts (${msg.mimeParts.length}):</strong>
-                        <table class="meta-table">
-                          <thead>
-                            <tr>
-                              <th>Part #</th>
-                              <th>Content-Type</th>
-                              <th>Charset</th>
-                              <th>Transfer-Encoding</th>
-                              <th>Decoded Size</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            ${msg.mimeParts.map(
-                              (p, idx) => html`
-                                <tr>
-                                  <td>#${idx + 1}</td>
-                                  <td><code>${p.contentType}</code></td>
-                                  <td><code>${p.charset}</code></td>
-                                  <td><code>${p.transferEncoding}</code></td>
-                                  <td>${p.sizeBytes} bytes</td>
-                                </tr>
+                <!-- Conversation Stream (All messages in thread) -->
+                <div class="conversation-stream">
+                  ${thread.messages.map((m, idx) => {
+                    const isExpanded = this.expandedMessageIds.has(m.id);
+                    const isLatest = idx === thread.messages.length - 1;
+
+                    if (!isExpanded) {
+                      // Collapsed Card
+                      return html`
+                        <div class="msg-card msg-card-collapsed" @click=${() => this._toggleMessageExpansion(m.id)}>
+                          <div class="avatar-circle" style="width: 28px; height: 28px; font-size: 0.7rem;">${m.senderInitials}</div>
+                          <span class="sender-name">${m.senderDisplayName}</span>
+                          <span class="collapsed-snippet">${m.cleanPreview}</span>
+                          <span class="collapsed-date">${m.formattedDateShort}</span>
+                          <span style="color: #888; font-size: 0.8rem;">▼</span>
+                        </div>
+                      `;
+                    }
+
+                    // Expanded Card
+                    return html`
+                      <div class="msg-card msg-card-expanded">
+                        <div class="sender-card">
+                          <div class="sender-card-left">
+                            <div class="avatar-circle">${m.senderInitials}</div>
+                            <div class="sender-meta">
+                              <div>
+                                <strong>${m.senderDisplayName}</strong>
+                                <span class="email-pill">&lt;${m.senderAddress}&gt;</span>
+                              </div>
+                              <div>
+                                <strong>To:</strong>
+                                <span class="email-pill">${m.recipient_email}</span>
+                                • <span>${m.formattedDateFull}</span>
+                              </div>
+                            </div>
+                          </div>
+                          ${!isLatest
+                            ? html`
+                                <button class="btn-action" style="padding: 4px 8px; font-size: 0.75rem;" @click=${() => this._toggleMessageExpansion(m.id)}>
+                                  ▲ Collapse
+                                </button>
                               `
-                            )}
-                          </tbody>
-                        </table>
-                        <br />
-                        <strong>Extracted Clean Plain-Text Stream:</strong>
-                        <hr />
-                        ${msg.cleanText}
+                            : ''}
+                        </div>
+
+                        <details class="meta-drawer">
+                          <summary>🔐 Security, Authentication &amp; MIME Envelope Metadata</summary>
+                          <div class="meta-grid">
+                            <span class="meta-label">Message ID:</span>
+                            <span><code>${m.id}</code></span>
+                            <span class="meta-label">Sender Domain:</span>
+                            <span><code>${m.senderDomain}</code></span>
+                            <span class="meta-label">Authentication:</span>
+                            <div class="security-pills">
+                              ${m.securityBadges.map(
+                                (b) => html`<span class="sec-pill">✓ ${b.label}</span>`
+                              )}
+                            </div>
+                            <span class="meta-label">MIME Structure:</span>
+                            <span>
+                              ${m.mimeBoundary
+                                ? html`Multipart (boundary: <code>${m.mimeBoundary}</code>)`
+                                : html`Standard RFC 5322 (${m.mimeParts.length} part)`}
+                            </span>
+                          </div>
+                        </details>
+
+                        <div class="reader-toolbar">
+                          <div class="render-mode-tabs">
+                            <button
+                              class="btn-action ${this.renderMode === 'rich' ? 'active' : ''}"
+                              @click=${() => {
+                                this.renderMode = 'rich';
+                              }}>
+                              ✨ Rich View
+                            </button>
+                            <button
+                              class="btn-action ${this.renderMode === 'plain' ? 'active' : ''}"
+                              @click=${() => {
+                                this.renderMode = 'plain';
+                              }}>
+                              📄 Plain Text
+                            </button>
+                            <button
+                              class="btn-action ${this.renderMode === 'meta' ? 'active' : ''}"
+                              @click=${() => {
+                                this.renderMode = 'meta';
+                              }}>
+                              🔍 MIME Inspector
+                            </button>
+                          </div>
+                        </div>
+
+                        ${this.renderMode === 'rich'
+                          ? html`<div class="reader-body-rich" data-msg-id="${m.id}"></div>`
+                          : this.renderMode === 'plain'
+                          ? html`<div class="reader-body-plain">${m.cleanText}</div>`
+                          : html`
+                              <div class="reader-body-plain">
+                                <strong>Parsed MIME Parts (${m.mimeParts.length}):</strong>
+                                <br />
+                                ${m.mimeParts.map(
+                                  (p, partIdx) => html`
+                                    <div>#${partIdx + 1}: ${p.contentType} (${p.sizeBytes} bytes, ${p.transferEncoding})</div>
+                                  `
+                                )}
+                                <hr />
+                                ${m.cleanText}
+                              </div>
+                            `}
                       </div>
-                    `}
+                    `;
+                  })}
+                </div>
+
+                <!-- Inline Quick Reply Box (Gmail & Outlook UX) -->
+                <div class="inline-reply-box">
+                  <div class="reply-header">
+                    <span>
+                      ↩ Reply to
+                      <strong>
+                        ${user && thread.latestMessage.senderAddress.toLowerCase() === user.email.toLowerCase()
+                          ? thread.latestMessage.recipient_email
+                          : thread.latestMessage.senderAddress}
+                      </strong>
+                    </span>
+                    <button
+                      class="btn-action"
+                      style="padding: 3px 8px; font-size: 0.78rem;"
+                      @click=${() => this._openFullComposeForReply(thread)}>
+                      ⤢ Open in Full Composer
+                    </button>
+                  </div>
+
+                  <textarea
+                    placeholder="Write a reply... (Enter your response here)"
+                    .value=${this.inlineReplyText}
+                    @input=${(e: Event) => {
+                      this.inlineReplyText = (e.target as HTMLTextAreaElement).value;
+                    }}></textarea>
+
+                  ${this.inlineReplyError
+                    ? html`<div style="color: #d32f2f; font-size: 0.82rem; font-weight: 600;">⚠️ ${this.inlineReplyError}</div>`
+                    : ''}
+                  ${this.inlineReplyNotice
+                    ? html`<div style="color: #2e7d32; font-size: 0.84rem; font-weight: 700;">✓ ${this.inlineReplyNotice}</div>`
+                    : ''}
+
+                  <div class="reply-actions">
+                    <button
+                      class="btn-action"
+                      style="padding: 6px 12px; font-size: 0.8rem;"
+                      @click=${() => this._quoteOriginalText()}>
+                      📄 Quote text
+                    </button>
+                    <button
+                      class="btn-send-reply"
+                      ?disabled=${this.inlineReplySending}
+                      @click=${() => this._sendInlineReply()}>
+                      ${this.inlineReplySending ? '🚀 Sending via Cloudflare...' : '🚀 Send Reply'}
+                    </button>
+                  </div>
+                </div>
               `
-            : html`<div class="empty-state">Select a message to read its full contents.</div>`}
+            : html`<div class="empty-state">Select a conversation thread to read messages.</div>`}
         </div>
       </div>
     `;

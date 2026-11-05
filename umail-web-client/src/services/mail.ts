@@ -14,6 +14,8 @@ export interface MailMessage {
   is_starred: boolean;
   spf_dmarc_status: string;
   received_at: string;
+  in_reply_to?: string;
+  thread_id?: string;
 }
 
 class MailService extends EventTarget {
@@ -40,7 +42,32 @@ class MailService extends EventTarget {
     return data.messages ?? [];
   }
 
-  async sendMessage(to: string, subject: string, bodyText: string): Promise<void> {
+  async fetchThread(threadId: string): Promise<MailMessage[]> {
+    const token = authService.getToken();
+    if (!token || !threadId) return [];
+
+    const res = await fetch(`${authService.getApiBase()}/api/umail/thread/${encodeURIComponent(threadId)}`, {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    if (!res.ok) {
+      return [];
+    }
+
+    const data = (await res.json()) as { messages: MailMessage[] };
+    return data.messages ?? [];
+  }
+
+  async sendMessage(
+    to: string,
+    subject: string,
+    bodyText: string,
+    bodyHtml?: string,
+    inReplyTo?: string,
+    threadId?: string
+  ): Promise<{ status: string; delivery_provider?: string }> {
     const token = authService.getToken();
     if (!token) throw new Error('Not authenticated');
 
@@ -53,7 +80,10 @@ class MailService extends EventTarget {
       body: JSON.stringify({
         to,
         subject,
-        body_text: bodyText
+        body_text: bodyText,
+        body_html: bodyHtml,
+        in_reply_to: inReplyTo,
+        thread_id: threadId
       })
     });
 
@@ -62,7 +92,9 @@ class MailService extends EventTarget {
       throw new Error(err.error ?? `Failed to send email (${res.status})`);
     }
 
+    const result = (await res.json()) as { status: string; delivery_provider?: string };
     this.dispatchEvent(new CustomEvent('mail-updated'));
+    return result;
   }
 
   async updateMessage(
