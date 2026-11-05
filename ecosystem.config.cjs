@@ -43,6 +43,12 @@ module.exports = {
         MASTER_DEVOPS_KEY: 'devops-master-key',
         BRIDGE_SECRET: 'cf-tunnel-secret',
         ALLOW_DEV_OTP_PREVIEW: 'true',
+        // Outbound HTTPS Email Relay (Port 443 — bypasses ISP/VPN Port 25/587 blocks):
+        // Set OUTBOUND_WORKER_URL to your Cloudflare Worker URL (e.g. 'https://kaposong-email-ingress.<subdomain>.workers.dev/send-email')
+        // or set RESEND_API_KEY / BREVO_API_KEY:
+        OUTBOUND_WORKER_URL: process.env.OUTBOUND_WORKER_URL || '',
+        RESEND_API_KEY: process.env.RESEND_API_KEY || '',
+        BREVO_API_KEY: process.env.BREVO_API_KEY || '',
       },
       out_file: path.join(ROOT_DIR, 'logs/rust-control-plane.log'),
       error_file: path.join(ROOT_DIR, 'logs/rust-control-plane.log'),

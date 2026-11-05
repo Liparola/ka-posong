@@ -36,21 +36,21 @@ fn split_headers_and_body(raw: &str) -> (&str, &str) {
 
 /// Unfolds RFC 5322 multi-line folded headers (lines starting with ' ' or '\t')
 fn unfold_headers(raw_headers: &str) -> Vec<(String, String)> {
-    let mut unfoldedLines: Vec<String> = Vec::new();
+    let mut unfolded_lines: Vec<String> = Vec::new();
     for line in raw_headers.lines() {
         let line = line.trim_end_matches('\r');
-        if (line.starts_with(' ') || line.starts_with('\t')) && !unfoldedLines.is_empty() {
-            if let Some(last) = unfoldedLines.last_mut() {
+        if (line.starts_with(' ') || line.starts_with('\t')) && !unfolded_lines.is_empty() {
+            if let Some(last) = unfolded_lines.last_mut() {
                 last.push(' ');
                 last.push_str(line.trim());
             }
         } else if !line.trim().is_empty() {
-            unfoldedLines.push(line.to_string());
+            unfolded_lines.push(line.to_string());
         }
     }
 
     let mut result = Vec::new();
-    for line in unfoldedLines {
+    for line in unfolded_lines {
         if let Some(colon) = line.find(':') {
             let key = line[..colon].trim().to_lowercase();
             let val = line[colon + 1..].trim().to_string();
@@ -531,4 +531,117 @@ pub async fn inject_smtp_to_stalwart(
         .map_err(|e| e.to_string())?;
 
     Ok(true)
+}
+
+/// Multi-Strategy Outbound Email Dispatcher (HTTPS Port 443 Edge Relay + SMTP Relay)
+pub async fn dispatch_outbound_email(
+    stalwart_smtp_addr: &str,
+    bridge_secret: &str,
+    from_name: &str,
+    from_email: &str,
+    to_email: &str,
+    subject: &str,
+    body_text: &str,
+    body_html: Option<&str>,
+    raw_mime: &str,
+) -> (bool, String) {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    // Strategy 1: Cloudflare Bidirectional Email Worker (`CLOUDFLARE_OUTBOUND_WORKER_URL`) over HTTPS Port 443
+    if let Ok(cf_url) = std::env::var("CLOUDFLARE_OUTBOUND_WORKER_URL") {
+        let cf_url = cf_url.trim();
+        if !cf_url.is_empty() {
+            let endpoint = if cf_url.ends_with("/send-email") {
+                cf_url.to_string()
+            } else {
+                format!("{}/send-email", cf_url.trim_end_matches('/'))
+            };
+            if let Ok(resp) = client
+                .post(&endpoint)
+                .header("X-Bridge-Secret", bridge_secret)
+                .json(&serde_json::json!({
+                    "from": from_email,
+                    "from_name": from_name,
+                    "to": to_email,
+                    "subject": subject,
+                    "body_text": body_text,
+                    "body_html": body_html,
+                    "raw_mime": raw_mime,
+                }))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    return (true, "cloudflare-worker-https".to_string());
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Direct Resend HTTPS API (`RESEND_API_KEY`) over Port 443
+    if let Ok(resend_key) = std::env::var("RESEND_API_KEY") {
+        let resend_key = resend_key.trim();
+        if !resend_key.is_empty() {
+            if let Ok(resp) = client
+                .post("https://api.resend.com/emails")
+                .bearer_auth(resend_key)
+                .json(&serde_json::json!({
+                    "from": format!("{} <{}>", from_name, from_email),
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": body_text,
+                    "html": body_html,
+                }))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    return (true, "resend-https-api".to_string());
+                }
+            }
+        }
+    }
+
+    // Strategy 3: Direct Brevo HTTPS API (`BREVO_API_KEY`) over Port 443
+    if let Ok(brevo_key) = std::env::var("BREVO_API_KEY") {
+        let brevo_key = brevo_key.trim();
+        if !brevo_key.is_empty() {
+            if let Ok(resp) = client
+                .post("https://api.brevo.com/v3/smtp/email")
+                .header("api-key", brevo_key)
+                .json(&serde_json::json!({
+                    "sender": { "name": from_name, "email": from_email },
+                    "to": [{ "email": to_email }],
+                    "subject": subject,
+                    "textContent": body_text,
+                    "htmlContent": body_html,
+                }))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    return (true, "brevo-https-api".to_string());
+                }
+            }
+        }
+    }
+
+    // Strategy 4: Local Stalwart / Smart Host SMTP Injection
+    let smtp_ok = inject_smtp_to_stalwart(
+        stalwart_smtp_addr,
+        from_email,
+        to_email,
+        raw_mime.as_bytes(),
+    )
+    .await
+    .unwrap_or(false);
+
+    if smtp_ok {
+        (true, "stalwart-smtp".to_string())
+    } else {
+        (false, "local-sent-store".to_string())
+    }
 }

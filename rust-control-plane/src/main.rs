@@ -34,7 +34,7 @@ use crate::{
     arms_webhook::dispatch_tenant_event,
     auth::{compute_hmac_hex, hash_api_key, rbac_middleware, AuthContext, Role},
     dashboard::render_ops_dashboard,
-    smtp_injector::{inject_smtp_to_stalwart, parse_rfc822_summary},
+    smtp_injector::{dispatch_outbound_email, inject_smtp_to_stalwart, parse_rfc822_summary},
     stalwart_api::{HttpStalwartClient, StalwartClient},
     tiers::BusinessTier,
     umail_api::{list_umail_messages, patch_umail_message, send_umail_message},
@@ -900,14 +900,18 @@ async fn send_transactional_handler(
         payload.body_text
     );
 
-    let relayed = inject_smtp_to_stalwart(
+    let (relayed, delivery_provider) = dispatch_outbound_email(
         &state.stalwart_smtp_addr,
+        &state.cloudflare_ingress_secret,
+        "Transactional Arm",
         &payload.from,
         &payload.to,
-        raw_mime.as_bytes(),
+        &payload.subject,
+        &payload.body_text,
+        payload.body_html.as_deref(),
+        &raw_mime,
     )
-    .await
-    .unwrap_or(false);
+    .await;
 
     // If recipient is a local mailbox, also store in their inbox
     let preview: String = payload.body_text.chars().take(120).collect();
@@ -932,7 +936,8 @@ async fn send_transactional_handler(
         "status": "TRANSACTIONAL_DISPATCHED",
         "message_id": msg_id,
         "tenant_id": tenant_id,
-        "stalwart_relayed": relayed
+        "stalwart_relayed": relayed,
+        "delivery_provider": delivery_provider
     })))
 }
 

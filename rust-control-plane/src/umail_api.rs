@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::{
     arms_webhook::dispatch_tenant_event,
     auth::{verify_umang_jwt, UmangJwtClaims},
-    smtp_injector::inject_smtp_to_stalwart,
+    smtp_injector::dispatch_outbound_email,
     AppState,
 };
 
@@ -251,15 +251,19 @@ pub async fn send_umail_message(
         .await;
     }
 
-    // 3. Inject into Stalwart SMTP engine for JMAP/IMAP sync and external Port 587 relay
-    let injected = inject_smtp_to_stalwart(
+    // 3. Multi-strategy Outbound Dispatch (Cloudflare Worker Port 443 -> Resend -> Brevo -> Stalwart SMTP)
+    let (injected, delivery_provider) = dispatch_outbound_email(
         &state.stalwart_smtp_addr,
+        &state.cloudflare_ingress_secret,
+        &claims.name,
         &claims.email,
         &recipient,
-        raw_mime.as_bytes(),
+        &payload.subject,
+        &payload.body_text,
+        payload.body_html.as_deref(),
+        &raw_mime,
     )
-    .await
-    .unwrap_or(false);
+    .await;
 
     // 4. Fire Extending Arm webhook event
     dispatch_tenant_event(
@@ -270,7 +274,8 @@ pub async fn send_umail_message(
             "message_id": msg_id,
             "from": claims.email,
             "to": recipient,
-            "subject": payload.subject
+            "subject": payload.subject,
+            "delivery_provider": delivery_provider
         }),
     )
     .await;
@@ -280,7 +285,8 @@ pub async fn send_umail_message(
         "message_id": msg_id,
         "from": claims.email,
         "to": recipient,
-        "stalwart_relayed": injected
+        "stalwart_relayed": injected,
+        "delivery_provider": delivery_provider
     })))
 }
 
