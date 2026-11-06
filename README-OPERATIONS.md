@@ -171,3 +171,50 @@ npx pm2 logs kaposong-umang-otp-bridge
 # Restart the Control Plane after configuration changes
 npx pm2 restart kaposong-rust-control-plane
 ```
+
+---
+
+## 7. Web Client Pro Features (Gmail-Grade Architecture)
+
+The uMail Web Client (`https://liparola.org/umail` and `https://liparola-ls.web.app`) incorporates industry-leading desktop email client features engineered for stability, user trust, and speed:
+
+### 1. Multi-Recipient To, Cc, and Bcc Routing
+- **Multiple Target Recipients:** Both `To`, `Cc`, and `Bcc` fields support multiple email addresses separated by commas, semicolons, or whitespace (e.g. `client@domain.co.ls, manager@liparola.org; director@corp.com`).
+- **Collapsible Cc & Bcc Rows:** Clean `+ Cc` and `+ Bcc` quick-toggle buttons in the `To` field keep the interface uncluttered while offering instant expansion.
+- **RFC 5322 §3.6.3 Strict Privacy Compliance:**
+  - `To` and `Cc` addresses are written into visible MIME headers.
+  - `Bcc` recipients are **strictly omitted** from wire headers to prevent recipient disclosure, while being individually relayed in the SMTP envelope (`RCPT TO:<addr>`).
+  - Local tenant mailboxes across `To`, `Cc`, and `Bcc` receive instant database delivery into their respective inboxes.
+
+### 2. Auto-Save Drafts in Background (Feature 1)
+- **Zero-Friction Auto-Save:** As the user types in `To`, `Cc`, `Bcc`, `Subject`, `Message Body`, or attaches files, drafts are debounced and persistently stored in `localStorage` and `IndexedDB`.
+- **Live Status Indicator:** Real-time indicator in the header and formatting toolbar shows `⏳ Saving draft...` and `☁️ Saved HH:MM:SS`.
+- **Automatic Recovery:** Re-opening the compose modal automatically restores any unsaved draft with a `"Restored unsaved draft"` banner.
+- **One-Click Discard:** A `🗑️ Discard Draft` button purges the cached draft and resets all fields.
+- **Automatic Cleanup:** Sent drafts are instantly purged upon successful delivery.
+
+### 3. "Undo Send" 7-Second Grace Countdown (Feature 2)
+- **Floating Countdown Snackbar:** When clicking "🚀 Send Email" or pressing `Ctrl+Enter`, the compose modal closes and a sleek floating snackbar appears:
+  `[ ⏱️ Sending message to <recipient> in 7s... ] [UNDO] [SEND NOW]`
+  accompanied by an animated thin countdown bar.
+- **Instant Abort & Edit Restoration:** Clicking `UNDO` aborts outbound transmission immediately and re-opens the composer with all text, formatting, recipients, and up to 120MB attachments intact.
+- **Immediate Dispatch:** Clicking `SEND NOW` skips the countdown and dispatches immediately via Cloudflare SMTPS Port 465.
+
+### 4. Rich Text Formatting Toolbar & Pro Keyboard Shortcuts (Feature 3)
+- **Formatting Toolbar:** Dedicated action bar above the message body providing:
+  - **Bold** (`**text**`)
+  - *Italic* (`*text*`)
+  - <u>Underline</u> (`_text_`)
+  - Blockquote (`> text`)
+  - Bulleted Lists (`- item`)
+  - Numbered Lists (`1. item`)
+  - Monospace / Code blocks (`` `code` `` and ```` ```code``` ````)
+  - Clear formatting (`Tx`)
+- **Pro Keyboard Shortcuts:**
+  - `Ctrl + Enter` (or `Cmd + Enter`): Send email or trigger Undo countdown immediately from modal or inline reply.
+  - `Escape`: Safely close modal (draft auto-saves).
+  - `Ctrl + B` / `Cmd + B`: Toggle **bold** on selected text.
+  - `Ctrl + I` / `Cmd + I`: Toggle *italic* on selected text.
+  - `Ctrl + U` / `Cmd + U`: Toggle <u>underline</u> on selected text.
+- **Multipart MIME Engine:** Formatted messages automatically generate rich `text/html` and `text/plain` alternative bodies, displaying beautifully in Gmail, Outlook, Apple Mail, and mobile clients.
+
