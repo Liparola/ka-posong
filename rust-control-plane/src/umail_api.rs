@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::{
     arms_webhook::dispatch_tenant_event,
     auth::{verify_umang_jwt, UmangJwtClaims},
-    smtp_injector::dispatch_outbound_email,
+    smtp_injector::{build_multipart_mime, dispatch_outbound_email, AttachmentPayload},
     AppState,
 };
 
@@ -42,6 +42,8 @@ pub struct MailMessageDto {
     pub received_at: String,
     pub in_reply_to: Option<String>,
     pub thread_id: Option<String>,
+    pub has_attachments: bool,
+    pub attachments: Option<Vec<AttachmentPayload>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +54,7 @@ pub struct SendMailPayload {
     pub body_html: Option<String>,
     pub in_reply_to: Option<String>,
     pub thread_id: Option<String>,
+    pub attachments: Option<Vec<AttachmentPayload>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,7 +100,7 @@ pub async fn list_umail_messages(
         let pattern = format!("%{}%", search);
         sqlx::query(
             r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
+                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id, has_attachments, attachments
                FROM mail_messages
                WHERE mailbox_email = ? AND (subject LIKE ? OR sender_email LIKE ? OR body_text LIKE ?)
                ORDER BY received_at DESC LIMIT 100"#,
@@ -111,7 +114,7 @@ pub async fn list_umail_messages(
     } else if folder == "starred" {
         sqlx::query(
             r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
+                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id, has_attachments, attachments
                FROM mail_messages
                WHERE mailbox_email = ? AND is_starred = 1
                ORDER BY received_at DESC LIMIT 100"#,
@@ -122,7 +125,7 @@ pub async fn list_umail_messages(
     } else {
         sqlx::query(
             r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
+                      is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id, has_attachments, attachments
                FROM mail_messages
                WHERE mailbox_email = ? AND folder = ?
                ORDER BY received_at DESC LIMIT 100"#,
@@ -141,22 +144,30 @@ pub async fn list_umail_messages(
 
     let messages: Vec<MailMessageDto> = rows
         .into_iter()
-        .map(|r| MailMessageDto {
-            id: r.get("id"),
-            folder: r.get("folder"),
-            sender_name: r.get("sender_name"),
-            sender_email: r.get("sender_email"),
-            recipient_email: r.get("recipient_email"),
-            subject: r.get("subject"),
-            preview: r.get("preview"),
-            body_text: r.get("body_text"),
-            body_html: r.get("body_html"),
-            is_read: r.get::<i64, _>("is_read") == 1,
-            is_starred: r.get::<i64, _>("is_starred") == 1,
-            spf_dmarc_status: r.get("spf_dmarc_status"),
-            received_at: r.get("received_at"),
-            in_reply_to: r.try_get("in_reply_to").ok(),
-            thread_id: r.try_get("thread_id").ok(),
+        .map(|r| {
+            let has_attachments = r.try_get::<i64, _>("has_attachments").map(|v| v == 1).unwrap_or(false);
+            let att_json: Option<String> = r.try_get("attachments").ok().flatten();
+            let attachments: Option<Vec<AttachmentPayload>> = att_json.and_then(|j| serde_json::from_str(&j).ok());
+
+            MailMessageDto {
+                id: r.get("id"),
+                folder: r.get("folder"),
+                sender_name: r.get("sender_name"),
+                sender_email: r.get("sender_email"),
+                recipient_email: r.get("recipient_email"),
+                subject: r.get("subject"),
+                preview: r.get("preview"),
+                body_text: r.get("body_text"),
+                body_html: r.get("body_html"),
+                is_read: r.get::<i64, _>("is_read") == 1,
+                is_starred: r.get::<i64, _>("is_starred") == 1,
+                spf_dmarc_status: r.get("spf_dmarc_status"),
+                received_at: r.get("received_at"),
+                in_reply_to: r.try_get("in_reply_to").ok(),
+                thread_id: r.try_get("thread_id").ok(),
+                has_attachments,
+                attachments,
+            }
         })
         .collect();
 
@@ -180,7 +191,7 @@ pub async fn get_umail_thread(
 
     let rows = sqlx::query(
         r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
-                  is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id
+                  is_read, is_starred, spf_dmarc_status, received_at, in_reply_to, thread_id, has_attachments, attachments
            FROM mail_messages
            WHERE (mailbox_email = ? OR sender_email = ?)
              AND (thread_id = ? OR id = ? OR in_reply_to = ?)
@@ -202,22 +213,30 @@ pub async fn get_umail_thread(
 
     let messages: Vec<MailMessageDto> = rows
         .into_iter()
-        .map(|r| MailMessageDto {
-            id: r.get("id"),
-            folder: r.get("folder"),
-            sender_name: r.get("sender_name"),
-            sender_email: r.get("sender_email"),
-            recipient_email: r.get("recipient_email"),
-            subject: r.get("subject"),
-            preview: r.get("preview"),
-            body_text: r.get("body_text"),
-            body_html: r.get("body_html"),
-            is_read: r.get::<i64, _>("is_read") == 1,
-            is_starred: r.get::<i64, _>("is_starred") == 1,
-            spf_dmarc_status: r.get("spf_dmarc_status"),
-            received_at: r.get("received_at"),
-            in_reply_to: r.try_get("in_reply_to").ok(),
-            thread_id: r.try_get("thread_id").ok(),
+        .map(|r| {
+            let has_attachments = r.try_get::<i64, _>("has_attachments").map(|v| v == 1).unwrap_or(false);
+            let att_json: Option<String> = r.try_get("attachments").ok().flatten();
+            let attachments: Option<Vec<AttachmentPayload>> = att_json.and_then(|j| serde_json::from_str(&j).ok());
+
+            MailMessageDto {
+                id: r.get("id"),
+                folder: r.get("folder"),
+                sender_name: r.get("sender_name"),
+                sender_email: r.get("sender_email"),
+                recipient_email: r.get("recipient_email"),
+                subject: r.get("subject"),
+                preview: r.get("preview"),
+                body_text: r.get("body_text"),
+                body_html: r.get("body_html"),
+                is_read: r.get::<i64, _>("is_read") == 1,
+                is_starred: r.get::<i64, _>("is_starred") == 1,
+                spf_dmarc_status: r.get("spf_dmarc_status"),
+                received_at: r.get("received_at"),
+                in_reply_to: r.try_get("in_reply_to").ok(),
+                thread_id: r.try_get("thread_id").ok(),
+                has_attachments,
+                attachments,
+            }
         })
         .collect();
 
@@ -243,8 +262,23 @@ pub async fn send_umail_message(
         ));
     }
 
+    let attachments = payload.attachments.unwrap_or_default();
+    let total_attachment_bytes: usize = attachments.iter().map(|a| a.size_bytes).sum();
+    const MAX_ATTACHMENTS_SIZE_BYTES: usize = 120 * 1024 * 1024; // Strict 120MB limit constraint
+    if total_attachment_bytes > MAX_ATTACHMENTS_SIZE_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Total attachments size ({:.1} MB) exceeds the strict 120MB limit (max: {} bytes)",
+                    total_attachment_bytes as f64 / (1024.0 * 1024.0),
+                    MAX_ATTACHMENTS_SIZE_BYTES
+                )
+            })),
+        ));
+    }
+
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-    let now_rfc2822 = chrono::Utc::now().to_rfc2822();
     let preview: String = payload.body_text.chars().take(120).collect();
 
     // Derive or resolve conversation thread_id
@@ -270,29 +304,31 @@ pub async fn send_umail_message(
     };
 
     let in_reply_to_clean = payload.in_reply_to.as_ref().map(|s| s.trim().to_string());
-    let mut thread_headers = String::new();
-    if let Some(ref ir) = in_reply_to_clean {
-        thread_headers.push_str(&format!("In-Reply-To: <{}>\r\nReferences: <{}>\r\n", ir, ir));
-    }
 
-    let raw_mime = format!(
-        "From: {} <{}>\r\nTo: <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\n{}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
-        claims.name,
-        claims.email,
-        recipient,
-        payload.subject,
-        now_rfc2822,
-        msg_id,
-        claims.domain,
-        thread_headers,
-        payload.body_text
+    let raw_mime = build_multipart_mime(
+        &claims.name,
+        &claims.email,
+        &recipient,
+        &payload.subject,
+        &payload.body_text,
+        payload.body_html.as_deref(),
+        in_reply_to_clean.as_deref(),
+        in_reply_to_clean.as_deref(),
+        &attachments,
     );
+
+    let has_attachments = if attachments.is_empty() { 0 } else { 1 };
+    let attachments_json = if attachments.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&attachments).ok()
+    };
 
     // 1. Store in sender's 'sent' folder
     sqlx::query(
         r#"INSERT INTO mail_messages
-           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id)
-           VALUES (?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'DKIM-SIGNED', ?, ?)"#,
+           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id, has_attachments, attachments)
+           VALUES (?, ?, ?, 'sent', ?, ?, ?, ?, ?, ?, ?, ?, 1, 'DKIM-SIGNED', ?, ?, ?, ?)"#,
     )
     .bind(&msg_id)
     .bind(&claims.client_id)
@@ -307,6 +343,8 @@ pub async fn send_umail_message(
     .bind(&raw_mime)
     .bind(&in_reply_to_clean)
     .bind(&thread_id)
+    .bind(has_attachments)
+    .bind(&attachments_json)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -329,8 +367,8 @@ pub async fn send_umail_message(
         let inbox_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
         let _ = sqlx::query(
             r#"INSERT INTO mail_messages
-               (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id)
-               VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Internal DKIM)', ?, ?)"#,
+               (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id, has_attachments, attachments)
+               VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Internal DKIM)', ?, ?, ?, ?)"#,
         )
         .bind(&inbox_id)
         .bind(&rcpt_tid)
@@ -345,11 +383,13 @@ pub async fn send_umail_message(
         .bind(&raw_mime)
         .bind(&in_reply_to_clean)
         .bind(&thread_id)
+        .bind(has_attachments)
+        .bind(&attachments_json)
         .execute(&state.db)
         .await;
     }
 
-    // 3. Multi-strategy Outbound Dispatch (Cloudflare Worker Port 443 -> Resend -> Brevo -> Stalwart SMTP)
+    // 3. Multi-strategy Outbound Dispatch (Cloudflare REST -> Cloudflare SMTPS 465 -> Stalwart SMTP)
     let (injected, delivery_provider) = dispatch_outbound_email(
         &state.stalwart_smtp_addr,
         &state.cloudflare_ingress_secret,
@@ -360,6 +400,7 @@ pub async fn send_umail_message(
         &payload.body_text,
         payload.body_html.as_deref(),
         &raw_mime,
+        &attachments,
     )
     .await;
 

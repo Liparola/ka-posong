@@ -1,6 +1,6 @@
 import { LitElement, html, css } from 'lit';
-import { customElement, property, state } from 'lit/decorators.js';
-import { mailService, type MailMessage } from '../services/mail';
+import { customElement, property, state, query } from 'lit/decorators.js';
+import { mailService, type MailMessage, type EmailAttachment } from '../services/mail';
 import { authService } from '../services/auth';
 import {
   normalizeMailMessage,
@@ -9,6 +9,13 @@ import {
   type NormalizedMailMessage,
   type EmailThread,
 } from '../utils/mime-renderer';
+import {
+  downloadAttachmentBlob,
+  formatBytes,
+  getAttachmentIcon,
+  validateAttachmentFile,
+  fileToAttachmentPayload,
+} from '../utils/attachment-cache';
 
 type RenderMode = 'rich' | 'plain' | 'meta';
 
@@ -25,15 +32,24 @@ export class ViewMailbox extends LitElement {
 
   // Inline Quick Reply State
   @state() private inlineReplyText = '';
+  @state() private inlineReplyAttachments: EmailAttachment[] = [];
+  @state() private inlineReplyReading = false;
+  @state() private inlineReplyReadingProgress = '';
   @state() private inlineReplySending = false;
   @state() private inlineReplyStage = '';
   @state() private inlineReplyNotice = '';
   @state() private inlineReplyError = '';
 
+  // Attachment Preview Lightbox State
+  @state() private previewModalAttachment: EmailAttachment | null = null;
+  @state() private previewModalOpen = false;
+
   // Toast Banner State
   @state() private toastMessage = '';
   @state() private toastType: 'success' | 'warning' | 'error' = 'success';
   private _toastTimeout?: number;
+
+  @query('#inline-reply-file-input') private inlineFileInputEl?: HTMLInputElement;
 
   private _mailUpdateHandler!: () => void;
   private _emailSentHandler!: (e: Event) => void;
@@ -660,6 +676,183 @@ export class ViewMailbox extends LitElement {
       padding: 48px 20px;
       color: #888;
     }
+
+    /* Message Attachments Section & Cards */
+    .message-attachments-section {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px dashed #dcd5f2;
+    }
+
+    .attachments-header {
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: #444;
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .attachments-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 10px;
+    }
+
+    .attachment-card {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      background: #fbfbfe;
+      border: 1px solid #e2e2ec;
+      border-radius: 10px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+      transition: all 0.15s ease;
+    }
+
+    .attachment-card:hover {
+      border-color: #6200ee;
+      box-shadow: 0 2px 6px rgba(98, 0, 238, 0.08);
+    }
+
+    .att-icon {
+      font-size: 1.5rem;
+      line-height: 1;
+    }
+
+    .att-meta {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .att-name {
+      font-size: 0.84rem;
+      font-weight: 600;
+      color: #333;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .att-size {
+      font-size: 0.74rem;
+      color: #777;
+    }
+
+    .att-actions {
+      display: flex;
+      gap: 4px;
+    }
+
+    .btn-att-action {
+      background: #f0f0f8;
+      border: 1px solid #d0d0e0;
+      color: #333;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.12s;
+    }
+
+    .btn-att-action:hover {
+      background: #6200ee;
+      color: #fff;
+      border-color: #6200ee;
+    }
+
+    /* Staged Attachment Chips in Inline Reply */
+    .inline-attachment-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .inline-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #fff;
+      border: 1px solid #d4c8f0;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 0.78rem;
+    }
+
+    .inline-chip .btn-remove {
+      background: transparent;
+      border: none;
+      color: #888;
+      font-weight: bold;
+      cursor: pointer;
+      font-size: 0.9rem;
+      line-height: 1;
+      padding: 0 2px;
+    }
+
+    .inline-chip .btn-remove:hover {
+      color: #d32f2f;
+    }
+
+    /* Lightbox / Preview Modal */
+    .preview-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 12, 28, 0.75);
+      z-index: 10000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .preview-modal-content {
+      background: #fff;
+      border-radius: 14px;
+      max-width: 90vw;
+      max-height: 90vh;
+      width: 780px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.4);
+    }
+
+    .preview-modal-header {
+      padding: 12px 18px;
+      background: #f7f6fc;
+      border-bottom: 1px solid #e4e2f0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    .preview-modal-body {
+      padding: 16px;
+      overflow: auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 250px;
+      max-height: 70vh;
+      background: #fafafc;
+    }
+
+    .preview-modal-footer {
+      padding: 10px 18px;
+      background: #f7f6fc;
+      border-top: 1px solid #e4e2f0;
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
   `;
 
   connectedCallback() {
@@ -854,7 +1047,9 @@ export class ViewMailbox extends LitElement {
     this.inlineReplyNotice = '';
 
     const stageTimer = setTimeout(() => {
-      this.inlineReplyStage = 'Transmitting RFC 5322 MIME envelope...';
+      this.inlineReplyStage = this.inlineReplyAttachments.length > 0
+        ? `Transmitting MIME envelope with ${this.inlineReplyAttachments.length} attachment(s)...`
+        : 'Transmitting RFC 5322 MIME envelope...';
     }, 450);
 
     try {
@@ -864,10 +1059,12 @@ export class ViewMailbox extends LitElement {
         text,
         undefined,
         latest.id,
-        this.selectedThread.threadKey.replace(/^tid_/, '').replace(/^subj_/, '')
+        this.selectedThread.threadKey.replace(/^tid_/, '').replace(/^subj_/, ''),
+        this.inlineReplyAttachments
       );
       clearTimeout(stageTimer);
       this.inlineReplyText = '';
+      this.inlineReplyAttachments = [];
 
       const provider = res.delivery_provider ?? 'Cloudflare Email Service';
       const isExternal = res.relayed_externally === true;
@@ -889,6 +1086,70 @@ export class ViewMailbox extends LitElement {
       this.inlineReplySending = false;
       this.inlineReplyStage = '';
     }
+  }
+
+  private async _handleInlineFileSelect(e: Event) {
+    const input = e.target as HTMLInputElement;
+    if (!input.files || input.files.length === 0) return;
+
+    const files = Array.from(input.files);
+    input.value = '';
+    this.inlineReplyError = '';
+
+    const currentTotal = this.inlineReplyAttachments.reduce((acc, a) => acc + (a.size_bytes || 0), 0);
+    let runningTotal = currentTotal;
+
+    for (const f of files) {
+      const val = validateAttachmentFile(f, runningTotal);
+      if (!val.valid) {
+        this.inlineReplyError = val.error || `File ${f.name} cannot be attached.`;
+        return;
+      }
+      runningTotal += f.size;
+    }
+
+    this.inlineReplyReading = true;
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        this.inlineReplyReadingProgress = `Staging ${f.name} (${i + 1}/${files.length})...`;
+        const att = await fileToAttachmentPayload(f, (pct) => {
+          this.inlineReplyReadingProgress = `Encoding ${f.name}: ${pct}%`;
+        });
+        this.inlineReplyAttachments = [...this.inlineReplyAttachments, att];
+      }
+    } catch (err: unknown) {
+      this.inlineReplyError = err instanceof Error ? err.message : 'Error attaching file';
+    } finally {
+      this.inlineReplyReading = false;
+      this.inlineReplyReadingProgress = '';
+    }
+  }
+
+  private _removeInlineAttachment(idx: number) {
+    this.inlineReplyAttachments = this.inlineReplyAttachments.filter((_, i) => i !== idx);
+  }
+
+  private _canPreview(att: EmailAttachment): boolean {
+    const ext = att.filename.split('.').pop()?.toLowerCase() || '';
+    const ct = (att.content_type || '').toLowerCase();
+    return (
+      ct.startsWith('image/') ||
+      ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'].includes(ext) ||
+      ct === 'application/pdf' ||
+      ext === 'pdf' ||
+      ['txt', 'json', 'md', 'log', 'csv', 'html', 'xml'].includes(ext)
+    );
+  }
+
+  private _openAttachmentPreview(att: EmailAttachment) {
+    this.previewModalAttachment = att;
+    this.previewModalOpen = true;
+  }
+
+  private _closeAttachmentPreview() {
+    this.previewModalOpen = false;
+    this.previewModalAttachment = null;
   }
 
   private _quoteOriginalText() {
@@ -976,6 +1237,9 @@ export class ViewMailbox extends LitElement {
                             : ''}
                           ${t.participants.some((p) => p.isSelf)
                             ? html`<span class="replied-tag">↩ Replied</span>`
+                            : ''}
+                          ${t.messages.some((m) => m.has_attachments || (m.attachments && m.attachments.length > 0))
+                            ? html`<span class="thread-pill" style="background:#eef2ff;color:#4338ca;">📎 Attached</span>`
                             : ''}
                         </span>
                         <span class="date">${t.lastDateShort}</span>
@@ -1120,6 +1384,52 @@ export class ViewMailbox extends LitElement {
                                 ${m.cleanText}
                               </div>
                             `}
+
+                        ${m.attachments && m.attachments.length > 0
+                          ? html`
+                              <div class="message-attachments-section">
+                                <div class="attachments-header">
+                                  <span>📎 Attachments (${m.attachments.length})</span>
+                                  <span style="font-size:0.78rem;color:#777;">
+                                    Total: ${formatBytes(m.attachments.reduce((acc, a) => acc + (a.size_bytes || 0), 0))}
+                                  </span>
+                                </div>
+                                <div class="attachments-grid">
+                                  ${m.attachments.map(
+                                    (att) => html`
+                                      <div class="attachment-card">
+                                        <div class="att-icon">${getAttachmentIcon(att.filename, att.content_type)}</div>
+                                        <div class="att-meta">
+                                          <span class="att-name" title="${att.filename}">${att.filename}</span>
+                                          <span class="att-size">${formatBytes(att.size_bytes)}</span>
+                                        </div>
+                                        <div class="att-actions">
+                                          ${this._canPreview(att)
+                                            ? html`
+                                                <button
+                                                  type="button"
+                                                  class="btn-att-action"
+                                                  title="Preview file"
+                                                  @click=${() => this._openAttachmentPreview(att)}>
+                                                  👁️ Preview
+                                                </button>
+                                              `
+                                            : ''}
+                                          <button
+                                            type="button"
+                                            class="btn-att-action"
+                                            title="Download file"
+                                            @click=${() => downloadAttachmentBlob(att, m.id)}>
+                                            ⬇ Download
+                                          </button>
+                                        </div>
+                                      </div>
+                                    `
+                                  )}
+                                </div>
+                              </div>
+                            `
+                          : ''}
                       </div>
                     `;
                   })}
@@ -1154,6 +1464,37 @@ export class ViewMailbox extends LitElement {
                       this.inlineReplyText = (e.target as HTMLTextAreaElement).value;
                     }}></textarea>
 
+                  <input
+                    id="inline-reply-file-input"
+                    type="file"
+                    multiple
+                    style="display:none;"
+                    @change=${this._handleInlineFileSelect}
+                  />
+
+                  ${this.inlineReplyReading
+                    ? html`<div style="font-size:0.8rem; color:#6200ee; font-weight:600;">
+                        ⏳ ${this.inlineReplyReadingProgress}
+                      </div>`
+                    : ''}
+
+                  ${this.inlineReplyAttachments.length > 0
+                    ? html`
+                        <div class="inline-attachment-chips">
+                          ${this.inlineReplyAttachments.map(
+                            (att, idx) => html`
+                              <div class="inline-chip">
+                                <span>${getAttachmentIcon(att.filename, att.content_type)}</span>
+                                <span style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${att.filename}</span>
+                                <span style="color:#777;">(${formatBytes(att.size_bytes)})</span>
+                                <button type="button" class="btn-remove" @click=${() => this._removeInlineAttachment(idx)}>&times;</button>
+                              </div>
+                            `
+                          )}
+                        </div>
+                      `
+                    : ''}
+
                   ${this.inlineReplyError
                     ? html`<div style="color: #d32f2f; font-size: 0.82rem; font-weight: 600;">⚠️ ${this.inlineReplyError}</div>`
                     : ''}
@@ -1162,16 +1503,26 @@ export class ViewMailbox extends LitElement {
                     : ''}
 
                   <div class="reply-actions">
-                    <button
-                      class="btn-action"
-                      style="padding: 6px 12px; font-size: 0.8rem;"
-                      ?disabled=${this.inlineReplySending}
-                      @click=${() => this._quoteOriginalText()}>
-                      📄 Quote text
-                    </button>
+                    <div style="display:flex;gap:6px;align-items:center;">
+                      <button
+                        class="btn-action"
+                        style="padding: 6px 12px; font-size: 0.8rem;"
+                        ?disabled=${this.inlineReplySending}
+                        @click=${() => this._quoteOriginalText()}>
+                        📄 Quote text
+                      </button>
+                      <button
+                        class="btn-action"
+                        style="padding: 6px 12px; font-size: 0.8rem;"
+                        ?disabled=${this.inlineReplySending || this.inlineReplyReading}
+                        @click=${() => this.inlineFileInputEl?.click()}>
+                        📎 Attach (Max 120MB)
+                      </button>
+                    </div>
+
                     <button
                       class="btn-send-reply"
-                      ?disabled=${this.inlineReplySending}
+                      ?disabled=${this.inlineReplySending || this.inlineReplyReading}
                       @click=${() => this._sendInlineReply()}>
                       ${this.inlineReplySending
                         ? html`<span>⏳ ${this.inlineReplyStage || 'Sending reply...'}</span>`
@@ -1183,6 +1534,53 @@ export class ViewMailbox extends LitElement {
             : html`<div class="empty-state">Select a conversation thread to read messages.</div>`}
         </div>
       </div>
+
+      <!-- Lightbox / Preview Modal for Attachments -->
+      ${this.previewModalOpen && this.previewModalAttachment
+        ? html`
+            <div class="preview-modal-backdrop" @click=${this._closeAttachmentPreview}>
+              <div class="preview-modal-content" @click=${(e: Event) => e.stopPropagation()}>
+                <div class="preview-modal-header">
+                  <span>
+                    ${getAttachmentIcon(this.previewModalAttachment.filename, this.previewModalAttachment.content_type)}
+                    ${this.previewModalAttachment.filename} (${formatBytes(this.previewModalAttachment.size_bytes)})
+                  </span>
+                  <button
+                    type="button"
+                    class="btn-action"
+                    style="padding:4px 8px;font-size:1rem;"
+                    @click=${this._closeAttachmentPreview}>
+                    &times;
+                  </button>
+                </div>
+                <div class="preview-modal-body">
+                  ${(this.previewModalAttachment.content_type || '').startsWith('image/')
+                    ? html`<img
+                        src="data:${this.previewModalAttachment.content_type};base64,${this.previewModalAttachment.content_base64.replace(/\s+/g, '')}"
+                        style="max-width:100%;max-height:65vh;object-fit:contain;border-radius:8px;"
+                        alt="${this.previewModalAttachment.filename}"
+                      />`
+                    : this.previewModalAttachment.content_type === 'application/pdf' || this.previewModalAttachment.filename.endsWith('.pdf')
+                    ? html`<iframe
+                        src="data:application/pdf;base64,${this.previewModalAttachment.content_base64.replace(/\s+/g, '')}"
+                        style="width:100%;height:65vh;border:none;"
+                      ></iframe>`
+                    : html`<pre
+                        style="white-space:pre-wrap;word-break:break-word;width:100%;max-height:65vh;overflow:auto;font-family:monospace;font-size:0.88rem;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;"
+                      >${atob(this.previewModalAttachment.content_base64.replace(/\s+/g, ''))}</pre>`}
+                </div>
+                <div class="preview-modal-footer">
+                  <button
+                    class="btn-action"
+                    @click=${() => downloadAttachmentBlob(this.previewModalAttachment!)}>
+                    ⬇ Download
+                  </button>
+                  <button class="btn-action" @click=${this._closeAttachmentPreview}>Close</button>
+                </div>
+              </div>
+            </div>
+          `
+        : ''}
     `;
   }
 }

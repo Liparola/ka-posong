@@ -5,11 +5,24 @@
 // ============================================================================
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STD, Engine as _};
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::{timeout, Duration},
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentPayload {
+    pub filename: String,
+    pub content_type: String,
+    pub content_base64: String,
+    pub size_bytes: usize,
+    #[serde(default)]
+    pub cid: Option<String>,
+    #[serde(default)]
+    pub disposition: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ParsedMimeSummary {
@@ -24,6 +37,7 @@ pub struct ParsedMimeSummary {
     pub in_reply_to: Option<String>,
     pub message_id: Option<String>,
     pub references: Option<String>,
+    pub attachments: Vec<AttachmentPayload>,
 }
 
 /// Splits headers and body from a raw RFC 5322 block
@@ -63,8 +77,8 @@ fn unfold_headers(raw_headers: &str) -> Vec<(String, String)> {
     result
 }
 
-/// Decodes Quoted-Printable byte stream (RFC 2045)
-pub fn decode_quoted_printable(input: &str) -> String {
+/// Decodes Quoted-Printable byte stream to raw bytes (RFC 2045)
+pub fn decode_quoted_printable_bytes(input: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(input.len());
     let raw = input.as_bytes();
     let mut i = 0;
@@ -92,6 +106,12 @@ pub fn decode_quoted_printable(input: &str) -> String {
         bytes.push(raw[i]);
         i += 1;
     }
+    bytes
+}
+
+/// Decodes Quoted-Printable byte stream to UTF-8 lossy string (RFC 2045)
+pub fn decode_quoted_printable(input: &str) -> String {
+    let bytes = decode_quoted_printable_bytes(input);
     String::from_utf8_lossy(&bytes).to_string()
 }
 
@@ -263,8 +283,195 @@ pub fn html_to_plain_text(html: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-/// Recursively walks a MIME entity (single-part or nested multipart/*) to extract `(text/plain, text/html)`
-fn extract_mime_parts(raw_entity: &str, out_text: &mut Option<String>, out_html: &mut Option<String>, depth: usize) {
+/// Extracts filename parameter from Content-Disposition or Content-Type headers
+fn extract_filename_from_headers(headers: &[(String, String)]) -> Option<String> {
+    for (k, v) in headers {
+        if k == "content-disposition" || k == "content-type" {
+            for segment in v.split(';') {
+                let trimmed = segment.trim();
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.starts_with("filename*=") {
+                    let val = trimmed[10..].trim();
+                    let decoded = if let Some(idx) = val.find("''") {
+                        let enc_part = &val[idx + 2..];
+                        decode_rfc2047_word(enc_part)
+                    } else {
+                        val.trim_matches('"').trim_matches('\'').to_string()
+                    };
+                    if !decoded.is_empty() {
+                        return Some(decoded);
+                    }
+                } else if lower.starts_with("filename=") {
+                    let val = trimmed[9..].trim().trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        return Some(decode_rfc2047_word(val));
+                    }
+                } else if lower.starts_with("name=") {
+                    let val = trimmed[5..].trim().trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        return Some(decode_rfc2047_word(val));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Sanitizes attachment filename to prevent path traversal or special control chars
+pub fn sanitize_attachment_filename(name: &str, default_ext: &str) -> String {
+    let clean: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\' && *c != '\0' && *c != '\"' && *c != '\'')
+        .collect();
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        format!("attachment_{}.{}", uuid::Uuid::new_v4().simple(), default_ext)
+    } else if trimmed.len() > 180 {
+        trimmed[..180].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Chunks Base64 into RFC 2045 compliant 76-character lines with \r\n linebreaks
+pub fn wrap_base64_76(input: &str) -> String {
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut out = String::with_capacity(cleaned.len() + (cleaned.len() / 76 + 1) * 2);
+    for chunk in cleaned.as_bytes().chunks(76) {
+        if let Ok(s) = std::str::from_utf8(chunk) {
+            out.push_str(s);
+            out.push_str("\r\n");
+        }
+    }
+    out
+}
+
+/// Builds a standards-compliant RFC 5322 MIME message supporting plain text, HTML, and file attachments
+pub fn build_multipart_mime(
+    from_name: &str,
+    from_email: &str,
+    to_email: &str,
+    subject: &str,
+    body_text: &str,
+    body_html: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+    attachments: &[AttachmentPayload],
+) -> String {
+    let now_rfc2822 = chrono::Utc::now().to_rfc2822();
+    let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let domain = from_email.split('@').nth(1).unwrap_or("liparola.org");
+
+    let mut headers = format!(
+        "From: {} <{}>\r\nTo: <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\nMIME-Version: 1.0\r\n",
+        from_name, from_email, to_email, subject, now_rfc2822, msg_id, domain
+    );
+
+    if let Some(ir) = in_reply_to {
+        let clean = ir.trim().trim_matches('<').trim_matches('>');
+        if !clean.is_empty() {
+            headers.push_str(&format!("In-Reply-To: <{}>\r\n", clean));
+        }
+    }
+    if let Some(rf) = references {
+        let clean = rf.trim();
+        if !clean.is_empty() {
+            headers.push_str(&format!("References: {}\r\n", clean));
+        }
+    }
+
+    if attachments.is_empty() {
+        if let Some(html) = body_html {
+            if !html.trim().is_empty() {
+                let alt_boundary = format!("----=_Part_alt_{}", uuid::Uuid::new_v4().simple());
+                headers.push_str(&format!(
+                    "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n",
+                    alt_boundary
+                ));
+                let body = format!(
+                    "--{}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n\r\n--{}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n\r\n--{}--\r\n",
+                    alt_boundary, body_text, alt_boundary, html, alt_boundary
+                );
+                return format!("{}{}", headers, body);
+            }
+        }
+        headers.push_str("Content-Type: text/plain; charset=utf-8; format=flowed\r\nContent-Transfer-Encoding: 8bit\r\n\r\n");
+        return format!("{}{}", headers, body_text);
+    }
+
+    // Attachments present -> multipart/mixed envelope
+    let mixed_boundary = format!("----=_Part_mixed_{}", uuid::Uuid::new_v4().simple());
+    headers.push_str(&format!(
+        "Content-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n",
+        mixed_boundary
+    ));
+
+    let mut mime_body = String::new();
+
+    // 1. Text/HTML alternative or plain text part
+    mime_body.push_str(&format!("--{}\r\n", mixed_boundary));
+    if let Some(html) = body_html {
+        if !html.trim().is_empty() {
+            let alt_boundary = format!("----=_Part_alt_{}", uuid::Uuid::new_v4().simple());
+            mime_body.push_str(&format!(
+                "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n",
+                alt_boundary
+            ));
+            mime_body.push_str(&format!(
+                "--{}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n\r\n--{}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n\r\n--{}--\r\n\r\n",
+                alt_boundary, body_text, alt_boundary, html, alt_boundary
+            ));
+        } else {
+            mime_body.push_str("Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n");
+            mime_body.push_str(body_text);
+            mime_body.push_str("\r\n\r\n");
+        }
+    } else {
+        mime_body.push_str("Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n");
+        mime_body.push_str(body_text);
+        mime_body.push_str("\r\n\r\n");
+    }
+
+    // 2. File attachment parts
+    for att in attachments {
+        let filename = sanitize_attachment_filename(&att.filename, "bin");
+        let disposition = att.disposition.as_deref().unwrap_or("attachment");
+        let content_type = if att.content_type.trim().is_empty() {
+            "application/octet-stream"
+        } else {
+            att.content_type.trim()
+        };
+
+        mime_body.push_str(&format!("--{}\r\n", mixed_boundary));
+        mime_body.push_str(&format!(
+            "Content-Type: {}; name=\"{}\"\r\nContent-Disposition: {}; filename=\"{}\"\r\n",
+            content_type, filename, disposition, filename
+        ));
+        if let Some(ref cid) = att.cid {
+            let clean_cid = cid.trim().trim_matches('<').trim_matches('>');
+            if !clean_cid.is_empty() {
+                mime_body.push_str(&format!("Content-ID: <{}>\r\n", clean_cid));
+            }
+        }
+        mime_body.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+        mime_body.push_str(&wrap_base64_76(&att.content_base64));
+        mime_body.push_str("\r\n\r\n");
+    }
+
+    mime_body.push_str(&format!("--{}--\r\n", mixed_boundary));
+
+    format!("{}{}", headers, mime_body)
+}
+
+/// Recursively walks a MIME entity (single-part or nested multipart/*) to extract `(text/plain, text/html, attachments)`
+fn extract_mime_parts(
+    raw_entity: &str,
+    out_text: &mut Option<String>,
+    out_html: &mut Option<String>,
+    out_attachments: &mut Vec<AttachmentPayload>,
+    depth: usize,
+) {
     if depth > 8 {
         return;
     }
@@ -275,6 +482,7 @@ fn extract_mime_parts(raw_entity: &str, out_text: &mut Option<String>, out_html:
     let mut content_type = "text/plain".to_string();
     let mut transfer_encoding = "7bit".to_string();
     let mut content_disposition = String::new();
+    let mut content_id: Option<String> = None;
 
     for (k, v) in &headers {
         if k == "content-type" {
@@ -283,15 +491,17 @@ fn extract_mime_parts(raw_entity: &str, out_text: &mut Option<String>, out_html:
             transfer_encoding = v.clone();
         } else if k == "content-disposition" {
             content_disposition = v.to_ascii_lowercase();
+        } else if k == "content-id" {
+            let cid = v.trim().trim_matches('<').trim_matches('>').trim().to_string();
+            if !cid.is_empty() {
+                content_id = Some(cid);
+            }
         }
     }
 
-    // Skip non-inline file attachments
-    if content_disposition.starts_with("attachment") {
-        return;
-    }
-
     let ct_lower = content_type.to_ascii_lowercase();
+
+    // Check if multipart container
     if ct_lower.starts_with("multipart/") {
         if let Some(boundary) = extract_boundary(&content_type) {
             let delimiter = format!("--{}", boundary);
@@ -303,12 +513,12 @@ fn extract_mime_parts(raw_entity: &str, out_text: &mut Option<String>, out_html:
                 let trimmed = line.trim_end_matches('\r');
                 if trimmed == end_delimiter || trimmed.starts_with(&end_delimiter) {
                     if inside_part && !current_part.trim().is_empty() {
-                        extract_mime_parts(&current_part, out_text, out_html, depth + 1);
+                        extract_mime_parts(&current_part, out_text, out_html, out_attachments, depth + 1);
                     }
                     break;
                 } else if trimmed == delimiter || trimmed.starts_with(&delimiter) {
                     if inside_part && !current_part.trim().is_empty() {
-                        extract_mime_parts(&current_part, out_text, out_html, depth + 1);
+                        extract_mime_parts(&current_part, out_text, out_html, out_attachments, depth + 1);
                     }
                     current_part.clear();
                     inside_part = true;
@@ -317,14 +527,14 @@ fn extract_mime_parts(raw_entity: &str, out_text: &mut Option<String>, out_html:
                     current_part.push_str("\r\n");
                 }
             }
-            if inside_part && !current_part.trim().is_empty() && out_text.is_none() && out_html.is_none() {
-                extract_mime_parts(&current_part, out_text, out_html, depth + 1);
+            if inside_part && !current_part.trim().is_empty() {
+                extract_mime_parts(&current_part, out_text, out_html, out_attachments, depth + 1);
             }
             return;
         }
     }
 
-    // Also handle the case where body_str itself starts with a `--boundary` (e.g. re-parsing a body_text without outer headers)
+    // Check if body starts with a boundary token without explicit Content-Type header
     let trimmed_body = raw_entity.trim_start();
     if trimmed_body.starts_with("--") {
         if let Some(first_line) = trimmed_body.lines().next() {
@@ -334,10 +544,48 @@ fn extract_mime_parts(raw_entity: &str, out_text: &mut Option<String>, out_html:
                     "Content-Type: multipart/alternative; boundary=\"{}\"\r\n\r\n{}",
                     b_cand, trimmed_body
                 );
-                extract_mime_parts(&synthetic, out_text, out_html, depth + 1);
+                extract_mime_parts(&synthetic, out_text, out_html, out_attachments, depth + 1);
                 return;
             }
         }
+    }
+
+    // Detect if this part is an attachment or inline asset
+    let filename_opt = extract_filename_from_headers(&headers);
+    let is_explicit_attachment = content_disposition.starts_with("attachment") || filename_opt.is_some();
+    let is_inline_media = (content_disposition.starts_with("inline") || content_id.is_some()) && !ct_lower.starts_with("text/");
+    let is_non_text_payload = !ct_lower.starts_with("text/") && !ct_lower.starts_with("multipart/");
+
+    if is_explicit_attachment || is_inline_media || is_non_text_payload {
+        let enc_lower = transfer_encoding.trim().to_ascii_lowercase();
+        let (content_b64, size_bytes) = if enc_lower == "base64" {
+            let cleaned: String = body_str.chars().filter(|c| !c.is_whitespace()).collect();
+            let size = (cleaned.len() * 3) / 4;
+            (cleaned, size)
+        } else if enc_lower == "quoted-printable" {
+            let decoded_bytes = decode_quoted_printable_bytes(body_str);
+            let size = decoded_bytes.len();
+            (BASE64_STD.encode(&decoded_bytes), size)
+        } else {
+            let bytes = body_str.as_bytes();
+            (BASE64_STD.encode(bytes), bytes.len())
+        };
+
+        let pure_type = content_type.split(';').next().unwrap_or("application/octet-stream").trim().to_string();
+        let filename = filename_opt.unwrap_or_else(|| {
+            let ext = pure_type.split('/').nth(1).unwrap_or("bin");
+            format!("attachment_{}.{}", out_attachments.len() + 1, ext)
+        });
+
+        out_attachments.push(AttachmentPayload {
+            filename: sanitize_attachment_filename(&filename, "bin"),
+            content_type: pure_type,
+            content_base64: content_b64,
+            size_bytes,
+            cid: content_id,
+            disposition: Some(if content_disposition.starts_with("inline") { "inline".to_string() } else { "attachment".to_string() }),
+        });
+        return;
     }
 
     let decoded = decode_transfer_encoding(body_str, &transfer_encoding);
@@ -410,7 +658,8 @@ pub fn parse_rfc822_summary(raw_mime: &[u8], fallback_from: &str) -> ParsedMimeS
 
     let mut extracted_text: Option<String> = None;
     let mut extracted_html: Option<String> = None;
-    extract_mime_parts(&text, &mut extracted_text, &mut extracted_html, 0);
+    let mut attachments: Vec<AttachmentPayload> = Vec::new();
+    extract_mime_parts(&text, &mut extracted_text, &mut extracted_html, &mut attachments, 0);
 
     let body_text = match (&extracted_text, &extracted_html) {
         (Some(t), _) if !t.trim().is_empty() => t.trim().to_string(),
@@ -455,6 +704,7 @@ pub fn parse_rfc822_summary(raw_mime: &[u8], fallback_from: &str) -> ParsedMimeS
         in_reply_to,
         message_id,
         references,
+        attachments,
     }
 }
 
@@ -557,7 +807,7 @@ pub async fn inject_smtp_to_stalwart(
     Ok(true)
 }
 
-/// Multi-Strategy Outbound Email Dispatcher (HTTPS Port 443 Edge Relay + SMTP Relay)
+/// Multi-Strategy Outbound Email Dispatcher (HTTPS Port 443 Edge Relay + SMTPS Port 465 + Stalwart SMTP Relay)
 pub async fn dispatch_outbound_email(
     stalwart_smtp_addr: &str,
     bridge_secret: &str,
@@ -568,61 +818,102 @@ pub async fn dispatch_outbound_email(
     body_text: &str,
     body_html: Option<&str>,
     raw_mime: &str,
+    attachments: &[AttachmentPayload],
 ) -> (bool, String) {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
+        .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default();
 
-    // Strategy 1: Cloudflare Email Sending Service REST API (Direct HTTPS Port 443)
-    // Uses Cloudflare Account ID & API Token with "Email Sending: Edit" permissions
+    let total_attachment_bytes: usize = attachments.iter().map(|a| a.size_bytes).sum();
+    // Cloudflare REST API (Beta) currently accepts only {to, from, subject, text, html} without attachments.
+    // Any message with attachments (or payloads > 20MB up to 120MB) is routed directly via Cloudflare SMTPS (Port 465).
+    let prefer_direct_smtps = !attachments.is_empty() || total_attachment_bytes > 20 * 1024 * 1024;
+
+    // Strategy 1: Cloudflare Email Sending Service (REST API or SMTPS 465)
     if let Ok(cf_token) = std::env::var("CLOUDFLARE_API_TOKEN") {
         let cf_token = cf_token.trim();
         if !cf_token.is_empty() {
             let cf_account = std::env::var("CLOUDFLARE_ACCOUNT_ID")
                 .unwrap_or_else(|_| "5d34290efd0db9537a45b9bb167f6e7f".to_string());
-            let endpoint = format!(
-                "https://api.cloudflare.com/client/v4/accounts/{}/email/sending/send",
-                cf_account.trim()
-            );
 
-            let mut req_body = serde_json::json!({
-                "from": from_email,
-                "to": to_email,
-                "subject": subject,
-                "text": body_text,
-            });
-            if let Some(html) = body_html {
-                if !html.is_empty() {
-                    req_body["html"] = serde_json::Value::String(html.to_string());
-                }
-            }
+            // Strategy 1A: REST API (for lightweight messages & attachments <= 20MB)
+            if !prefer_direct_smtps {
+                let endpoint = format!(
+                    "https://api.cloudflare.com/client/v4/accounts/{}/email/sending/send",
+                    cf_account.trim()
+                );
 
-            match client
-                .post(&endpoint)
-                .bearer_auth(cf_token)
-                .header("Content-Type", "application/json")
-                .json(&req_body)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let resp_txt = resp.text().await.unwrap_or_default();
-                    if status.is_success() {
-                        tracing::info!("✅ Outbound dispatched via Cloudflare Email Sending REST API: {}", resp_txt);
-                        return (true, "cloudflare-email-sending-rest-api".to_string());
-                    } else {
-                        tracing::warn!("⚠️ Cloudflare Email Sending REST API returned {}: {}", status, resp_txt);
+                let mut req_body = serde_json::json!({
+                    "from": from_email,
+                    "to": to_email,
+                    "subject": subject,
+                    "text": body_text,
+                });
+                if let Some(html) = body_html {
+                    if !html.is_empty() {
+                        req_body["html"] = serde_json::Value::String(html.to_string());
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("⚠️ Cloudflare Email Sending REST API error: {}", e);
+                if !attachments.is_empty() {
+                    let cf_att_list: Vec<serde_json::Value> = attachments
+                        .iter()
+                        .map(|att| {
+                            serde_json::json!({
+                                "filename": sanitize_attachment_filename(&att.filename, "bin"),
+                                "type": att.content_type,
+                                "content": att.content_base64
+                            })
+                        })
+                        .collect();
+                    req_body["attachments"] = serde_json::Value::Array(cf_att_list);
+                }
+
+                match client
+                    .post(&endpoint)
+                    .bearer_auth(cf_token)
+                    .header("Content-Type", "application/json")
+                    .json(&req_body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let resp_txt = resp.text().await.unwrap_or_default();
+                        if status.is_success() {
+                            tracing::info!(
+                                "✅ Outbound dispatched via Cloudflare Email Sending REST API ({} attachments, {} bytes): {}",
+                                attachments.len(),
+                                total_attachment_bytes,
+                                resp_txt
+                            );
+                            return (true, "cloudflare-email-sending-rest-api".to_string());
+                        } else {
+                            tracing::warn!(
+                                "⚠️ Cloudflare Email Sending REST API returned {}: {}. Failing over to Cloudflare SMTPS (Port 465)...",
+                                status,
+                                resp_txt
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "⚠️ Cloudflare Email Sending REST API error: {}. Failing over to Cloudflare SMTPS (Port 465)...",
+                            e
+                        );
+                    }
                 }
             }
 
             // Strategy 1B: Cloudflare SMTPS (Implicit TLS Port 465)
-            // Host: smtp.mx.cloudflare.net:465 with api_token:<token>
+            // Supports large raw RFC 5322 MIME messages up to 120MB streaming
+            tracing::info!(
+                "🚀 Dispatching outbound RFC 5322 MIME envelope via Cloudflare SMTPS (Port 465) to {} (attachments: {}, total bytes: {})...",
+                to_email,
+                attachments.len(),
+                total_attachment_bytes
+            );
+
             let mut curl_cmd = tokio::process::Command::new("curl");
             curl_cmd
                 .arg("-sS")
@@ -647,11 +938,19 @@ pub async fn dispatch_outbound_email(
                 }
                 if let Ok(output) = child.wait_with_output().await {
                     if output.status.success() {
-                        tracing::info!("✅ Outbound dispatched via Cloudflare SMTPS (Port 465) to {}", to_email);
+                        tracing::info!(
+                            "✅ Outbound successfully delivered via Cloudflare SMTPS (Port 465) to {} ({} attachments)",
+                            to_email,
+                            attachments.len()
+                        );
                         return (true, "cloudflare-smtps-port465".to_string());
                     } else {
                         let err_msg = String::from_utf8_lossy(&output.stderr);
-                        tracing::warn!("⚠️ Cloudflare SMTPS (Port 465) returned {}: {}", output.status, err_msg.trim());
+                        tracing::warn!(
+                            "⚠️ Cloudflare SMTPS (Port 465) returned {}: {}",
+                            output.status,
+                            err_msg.trim()
+                        );
                     }
                 }
             }

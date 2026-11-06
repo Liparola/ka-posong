@@ -1064,6 +1064,7 @@ async fn send_transactional_handler(
         &payload.body_text,
         payload.body_html.as_deref(),
         &raw_mime,
+        &[],
     )
     .await;
 
@@ -1207,10 +1208,17 @@ async fn ingest_tunneled_mime_handler(
         msg_id.clone()
     };
 
+    let has_attachments = if parsed.attachments.is_empty() { 0 } else { 1 };
+    let attachments_json = if parsed.attachments.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&parsed.attachments).ok()
+    };
+
     sqlx::query(
         r#"INSERT INTO mail_messages
-           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id)
-           VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)"#,
+           (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id, has_attachments, attachments)
+           VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)"#,
     )
     .bind(&msg_id)
     .bind(&tenant_id)
@@ -1226,6 +1234,8 @@ async fn ingest_tunneled_mime_handler(
     .bind(&parsed.spf_dmarc_status)
     .bind(&in_rep)
     .bind(&thread_id)
+    .bind(has_attachments)
+    .bind(&attachments_json)
     .execute(&state.db)
     .await
     .map_err(|e| {
@@ -1307,9 +1317,10 @@ async fn initialize_database_and_seed_liparola(
         }
     }
 
-    // Auto-healing migrations for thread tracking & in-reply-to headers
+    // Auto-healing migrations for thread tracking & in-reply-to headers & attachments
     let _ = sqlx::query("ALTER TABLE mail_messages ADD COLUMN in_reply_to TEXT").execute(pool).await;
     let _ = sqlx::query("ALTER TABLE mail_messages ADD COLUMN thread_id TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE mail_messages ADD COLUMN attachments TEXT").execute(pool).await;
 
     // Ensure first flagship tenant `liparola.org` is provisioned out-of-the-box
     let exists: Option<String> =
@@ -1575,13 +1586,15 @@ async fn main() {
         .route("/api/v1/domains/:domain/dns", get(get_domain_dns_handler))
         .route("/ops", get(render_ops_dashboard))
         .route("/ops-dashboard", get(render_ops_dashboard))
-        .nest_service("/umail", serve_umail);
+        .nest_service("/umail", serve_umail)
+        .layer(axum::extract::DefaultBodyLimit::max(160 * 1024 * 1024));
 
     let cors = CorsLayer::permissive();
 
     let app = Router::new()
         .merge(protected_api)
         .merge(public_routes)
+        .layer(axum::extract::DefaultBodyLimit::max(160 * 1024 * 1024))
         .layer(cors)
         .layer(middleware::from_fn(
             |req: axum::extract::Request, next: middleware::Next| async move {

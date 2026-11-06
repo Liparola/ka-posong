@@ -1,5 +1,14 @@
 import { authService } from './auth';
 
+export interface EmailAttachment {
+  filename: string;
+  content_type: string;
+  content_base64: string;
+  size_bytes: number;
+  cid?: string;
+  disposition?: string;
+}
+
 export interface MailMessage {
   id: string;
   folder: 'inbox' | 'sent' | 'drafts' | 'archive' | 'trash';
@@ -16,6 +25,8 @@ export interface MailMessage {
   received_at: string;
   in_reply_to?: string;
   thread_id?: string;
+  has_attachments?: boolean;
+  attachments?: EmailAttachment[];
 }
 
 class MailService extends EventTarget {
@@ -66,7 +77,8 @@ class MailService extends EventTarget {
     bodyText: string,
     bodyHtml?: string,
     inReplyTo?: string,
-    threadId?: string
+    threadId?: string,
+    attachments?: EmailAttachment[]
   ): Promise<{
     status: string;
     delivery_provider?: string;
@@ -88,7 +100,8 @@ class MailService extends EventTarget {
         body_text: bodyText,
         body_html: bodyHtml,
         in_reply_to: inReplyTo,
-        thread_id: threadId
+        thread_id: threadId,
+        attachments: attachments && attachments.length > 0 ? attachments : undefined
       })
     });
 

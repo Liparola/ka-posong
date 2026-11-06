@@ -129,8 +129,16 @@ export function safeSetEmailHTML(el: HTMLElement, untrustedHtml: string): void {
         if (!allowedAttrSet.has(name) || name.startsWith('on') || name.startsWith('data-') || name.startsWith('aria-')) {
           continue;
         }
-        if ((name === 'href' || name === 'src') && /^(javascript|vbscript|data):/i.test(val)) {
-          continue;
+        if (name === 'src') {
+          if (/^(javascript|vbscript):/i.test(val)) continue;
+          // Permit safe data:image/ URIs for inline/embedded images; block any other data types
+          if (/^data:/i.test(val) && !/^data:image\/(png|jpe?g|gif|webp|svg\+xml|bmp|ico);base64,/i.test(val)) {
+            continue;
+          }
+        } else if (name === 'href') {
+          if (/^(javascript|vbscript|data):/i.test(val)) {
+            continue;
+          }
         }
         cleanEl.setAttribute(attr.name, val);
       }
@@ -284,8 +292,43 @@ export function stripHtmlToText(html: string): string {
 }
 
 /**
+ * Converts text emoticons and common markdown sequences into rich modern typography
+ */
+export function convertEmoticonsAndMarkdown(escapedText: string): string {
+  const emoticons: [RegExp, string][] = [
+    [/(?<=^|\s):-?\)(?=\s|$)/g, '😊'],
+    [/(?<=^|\s):-?D(?=\s|$)/g, '😃'],
+    [/(?<=^|\s):-?\((?=\s|$)/g, '😞'],
+    [/(?<=^|\s);-?\)(?=\s|$)/g, '😉'],
+    [/(?<=^|\s):-?[pP](?=\s|$)/g, '😋'],
+    [/(?<=^|\s)&lt;3(?=\s|$)/g, '❤️'],
+    [/(?<=^|\s)\(y\)(?=\s|$)/gi, '👍'],
+    [/(?<=^|\s):\+1:(?=\s|$)/g, '👍'],
+    [/(?<=^|\s):thumbsup:(?=\s|$)/g, '👍'],
+    [/(?<=^|\s):fire:(?=\s|$)/g, '🔥'],
+    [/(?<=^|\s):rocket:(?=\s|$)/g, '🚀'],
+    [/(?<=^|\s):star:(?=\s|$)/g, '⭐'],
+    [/(?<=^|\s):check:(?=\s|$)/g, '✅'],
+    [/(?<=^|\s):warning:(?=\s|$)/g, '⚠️'],
+  ];
+
+  let result = escapedText;
+  for (const [re, emoji] of emoticons) {
+    result = result.replace(re, emoji);
+  }
+
+  // Inline markdown formatting: `code`, **bold**, *italic*
+  result = result
+    .replace(/`([^`]+)`/g, '<code style="background:#f0f0f8;padding:2px 5px;border-radius:4px;font-family:monospace;font-size:0.9em;">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+
+  return result;
+}
+
+/**
  * Converts clean plain text into well-structured HTML with clickable links,
- * styled reply quotes (`>`), and signature dividers (`-- `).
+ * styled reply quotes (`>`), emoticons, and signature dividers (`-- `).
  */
 export function formatPlainTextToHtml(plainText: string): string {
   if (!plainText) return '<p><em>(Empty message body)</em></p>';
@@ -323,7 +366,8 @@ export function formatPlainTextToHtml(plainText: string): string {
     const trimmed = rawLine.trim();
     if (trimmed.startsWith('>')) {
       const cleanQuote = trimmed.replace(/^>+\s?/, '');
-      quoteBuffer.push(linkify(escapeHtml(cleanQuote)));
+      const formattedQuote = convertEmoticonsAndMarkdown(linkify(escapeHtml(cleanQuote)));
+      quoteBuffer.push(formattedQuote);
     } else {
       flushQuotes();
       if (trimmed === '--' || rawLine === '-- ' || /^_{4,}$/.test(trimmed)) {
@@ -331,7 +375,8 @@ export function formatPlainTextToHtml(plainText: string): string {
       } else if (trimmed === '') {
         blocks.push('<br>');
       } else {
-        blocks.push(`<div>${linkify(escapeHtml(rawLine))}</div>`);
+        const formattedLine = convertEmoticonsAndMarkdown(linkify(escapeHtml(rawLine)));
+        blocks.push(`<div>${formattedLine}</div>`);
       }
     }
   }
@@ -556,6 +601,28 @@ export function normalizeMailMessage(msg: MailMessage): NormalizedMailMessage {
     { label: 'TLS Edge Tunnel', ok: true },
   ];
 
+  // Resolve CID inline images against message attachments
+  let resolvedHtml = parsedMime.html;
+  if (msg.attachments && msg.attachments.length > 0) {
+    for (const att of msg.attachments) {
+      if (att.content_base64) {
+        const mimeType = att.content_type || 'image/png';
+        const cleanB64 = att.content_base64.replace(/\s+/g, '');
+        const dataUri = `data:${mimeType};base64,${cleanB64}`;
+
+        if (att.cid) {
+          const cleanCid = att.cid.replace(/^<|>$/g, '').trim();
+          const cidRegex = new RegExp(`src=["']cid:${cleanCid.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}["']`, 'gi');
+          resolvedHtml = resolvedHtml.replace(cidRegex, `src="${dataUri}"`);
+        }
+        if (att.filename) {
+          const fnRegex = new RegExp(`src=["']cid:${att.filename.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}["']`, 'gi');
+          resolvedHtml = resolvedHtml.replace(fnRegex, `src="${dataUri}"`);
+        }
+      }
+    }
+  }
+
   return {
     ...msg,
     subject: decodeRfc2047(msg.subject || '(No Subject)'),
@@ -565,7 +632,9 @@ export function normalizeMailMessage(msg: MailMessage): NormalizedMailMessage {
     senderDomain: domain,
     cleanPreview: singleLinePreview || '(No preview available)',
     cleanText: parsedMime.text,
-    cleanHtml: parsedMime.html,
+    cleanHtml: resolvedHtml,
+    has_attachments: msg.has_attachments || (msg.attachments && msg.attachments.length > 0) || false,
+    attachments: msg.attachments || [],
     formattedDateShort: short,
     formattedDateFull: full,
     mimeBoundary: parsedMime.boundary,
