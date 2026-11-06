@@ -1593,9 +1593,15 @@ export class ViewMailbox extends LitElement {
                   </div>
 
                   <textarea
-                    placeholder="Write a reply... (Enter your response here)"
+                    placeholder="Write a reply... (Press Ctrl+Enter to send)"
                     .value=${this.inlineReplyText}
                     ?disabled=${this.inlineReplySending}
+                    @keydown=${(e: KeyboardEvent) => {
+                      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                        e.preventDefault();
+                        this._sendInlineReply();
+                      }
+                    }}
                     @input=${(e: Event) => {
                       this.inlineReplyText = (e.target as HTMLTextAreaElement).value;
                     }}></textarea>

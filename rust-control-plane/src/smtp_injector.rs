@@ -347,11 +347,36 @@ pub fn wrap_base64_76(input: &str) -> String {
     out
 }
 
-/// Builds a standards-compliant RFC 5322 MIME message supporting plain text, HTML, and file attachments
+/// Parses raw comma/semicolon-separated recipients into clean lowercase email addresses
+pub fn parse_recipient_list(raw: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for part in raw.split([',', ';']) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let email = if let (Some(lt), Some(gt)) = (trimmed.find('<'), trimmed.rfind('>')) {
+            if lt < gt {
+                trimmed[lt + 1..gt].trim().to_lowercase()
+            } else {
+                trimmed.to_lowercase()
+            }
+        } else {
+            trimmed.trim_matches('"').trim_matches('\'').trim().to_lowercase()
+        };
+        if email.contains('@') && !email.contains(' ') && !result.contains(&email) {
+            result.push(email);
+        }
+    }
+    result
+}
+
+/// Builds a standards-compliant RFC 5322 MIME message supporting multiple To recipients, Cc recipients, HTML, and file attachments
 pub fn build_multipart_mime(
     from_name: &str,
     from_email: &str,
-    to_email: &str,
+    to_emails: &[String],
+    cc_emails: &[String],
     subject: &str,
     body_text: &str,
     body_html: Option<&str>,
@@ -363,10 +388,29 @@ pub fn build_multipart_mime(
     let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let domain = from_email.split('@').nth(1).unwrap_or("liparola.org");
 
+    let formatted_to = if to_emails.is_empty() {
+        "<undisclosed-recipients:;>".to_string()
+    } else {
+        to_emails
+            .iter()
+            .map(|e| format!("<{}>", e.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     let mut headers = format!(
-        "From: {} <{}>\r\nTo: <{}>\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\nMIME-Version: 1.0\r\n",
-        from_name, from_email, to_email, subject, now_rfc2822, msg_id, domain
+        "From: {} <{}>\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{}@{}>\r\nMIME-Version: 1.0\r\n",
+        from_name, from_email, formatted_to, subject, now_rfc2822, msg_id, domain
     );
+
+    if !cc_emails.is_empty() {
+        let formatted_cc = cc_emails
+            .iter()
+            .map(|e| format!("<{}>", e.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        headers.push_str(&format!("Cc: {}\r\n", formatted_cc));
+    }
 
     if let Some(ir) = in_reply_to {
         let clean = ir.trim().trim_matches('<').trim_matches('>');
@@ -808,12 +852,15 @@ pub async fn inject_smtp_to_stalwart(
 }
 
 /// Multi-Strategy Outbound Email Dispatcher (HTTPS Port 443 Edge Relay + SMTPS Port 465 + Stalwart SMTP Relay)
+/// Supports multiple To recipients, Cc (Carbon Copy), Bcc (Blind Carbon Copy) and up to 120MB attachments
 pub async fn dispatch_outbound_email(
     stalwart_smtp_addr: &str,
     bridge_secret: &str,
     from_name: &str,
     from_email: &str,
-    to_email: &str,
+    to_emails: &[String],
+    cc_emails: &[String],
+    bcc_emails: &[String],
     subject: &str,
     body_text: &str,
     body_html: Option<&str>,
@@ -825,10 +872,28 @@ pub async fn dispatch_outbound_email(
         .build()
         .unwrap_or_default();
 
+    let mut all_envelope_rcpts: Vec<String> = Vec::new();
+    for email in to_emails.iter().chain(cc_emails.iter()).chain(bcc_emails.iter()) {
+        let clean = email.trim().to_lowercase();
+        if !clean.is_empty() && !all_envelope_rcpts.contains(&clean) {
+            all_envelope_rcpts.push(clean);
+        }
+    }
+
+    if all_envelope_rcpts.is_empty() {
+        return (false, "no-recipients-provided".to_string());
+    }
+
+    let primary_rcpt = to_emails.first().cloned().unwrap_or_else(|| all_envelope_rcpts[0].clone());
     let total_attachment_bytes: usize = attachments.iter().map(|a| a.size_bytes).sum();
-    // Cloudflare REST API (Beta) currently accepts only {to, from, subject, text, html} without attachments.
-    // Any message with attachments (or payloads > 20MB up to 120MB) is routed directly via Cloudflare SMTPS (Port 465).
-    let prefer_direct_smtps = !attachments.is_empty() || total_attachment_bytes > 20 * 1024 * 1024;
+    // Cloudflare REST API (Beta) is best suited for simple single-recipient text/HTML messages.
+    // When Cc/Bcc are present, multiple To exist, attachments exist, or payloads > 20MB (up to 120MB),
+    // route directly via Cloudflare SMTPS (Port 465) for full standard RFC 5321/5322 compliance.
+    let prefer_direct_smtps = !attachments.is_empty()
+        || !cc_emails.is_empty()
+        || !bcc_emails.is_empty()
+        || to_emails.len() > 1
+        || total_attachment_bytes > 20 * 1024 * 1024;
 
     // Strategy 1: Cloudflare Email Sending Service (REST API or SMTPS 465)
     if let Ok(cf_token) = std::env::var("CLOUDFLARE_API_TOKEN") {
@@ -837,7 +902,7 @@ pub async fn dispatch_outbound_email(
             let cf_account = std::env::var("CLOUDFLARE_ACCOUNT_ID")
                 .unwrap_or_else(|_| "5d34290efd0db9537a45b9bb167f6e7f".to_string());
 
-            // Strategy 1A: REST API (for lightweight messages & attachments <= 20MB)
+            // Strategy 1A: REST API (for lightweight messages without attachments & single recipient)
             if !prefer_direct_smtps {
                 let endpoint = format!(
                     "https://api.cloudflare.com/client/v4/accounts/{}/email/sending/send",
@@ -846,7 +911,7 @@ pub async fn dispatch_outbound_email(
 
                 let mut req_body = serde_json::json!({
                     "from": from_email,
-                    "to": to_email,
+                    "to": primary_rcpt,
                     "subject": subject,
                     "text": body_text,
                 });
@@ -854,19 +919,6 @@ pub async fn dispatch_outbound_email(
                     if !html.is_empty() {
                         req_body["html"] = serde_json::Value::String(html.to_string());
                     }
-                }
-                if !attachments.is_empty() {
-                    let cf_att_list: Vec<serde_json::Value> = attachments
-                        .iter()
-                        .map(|att| {
-                            serde_json::json!({
-                                "filename": sanitize_attachment_filename(&att.filename, "bin"),
-                                "type": att.content_type,
-                                "content": att.content_base64
-                            })
-                        })
-                        .collect();
-                    req_body["attachments"] = serde_json::Value::Array(cf_att_list);
                 }
 
                 match client
@@ -906,10 +958,13 @@ pub async fn dispatch_outbound_email(
             }
 
             // Strategy 1B: Cloudflare SMTPS (Implicit TLS Port 465)
-            // Supports large raw RFC 5322 MIME messages up to 120MB streaming
+            // Supports multiple To, Cc, Bcc, and large raw RFC 5322 MIME messages up to 120MB streaming
             tracing::info!(
-                "🚀 Dispatching outbound RFC 5322 MIME envelope via Cloudflare SMTPS (Port 465) to {} (attachments: {}, total bytes: {})...",
-                to_email,
+                "🚀 Dispatching outbound RFC 5322 MIME envelope via Cloudflare SMTPS (Port 465) to {} recipient(s) [To: {}, Cc: {}, Bcc: {}] (attachments: {}, total bytes: {})...",
+                all_envelope_rcpts.len(),
+                to_emails.len(),
+                cc_emails.len(),
+                bcc_emails.len(),
                 attachments.len(),
                 total_attachment_bytes
             );
@@ -923,9 +978,13 @@ pub async fn dispatch_outbound_email(
                 .arg("--user")
                 .arg(format!("api_token:{}", cf_token))
                 .arg("--mail-from")
-                .arg(from_email)
-                .arg("--mail-rcpt")
-                .arg(to_email)
+                .arg(from_email);
+
+            for rcpt in &all_envelope_rcpts {
+                curl_cmd.arg("--mail-rcpt").arg(rcpt);
+            }
+
+            curl_cmd
                 .arg("-T")
                 .arg("-")
                 .stdin(std::process::Stdio::piped())
@@ -939,8 +998,8 @@ pub async fn dispatch_outbound_email(
                 if let Ok(output) = child.wait_with_output().await {
                     if output.status.success() {
                         tracing::info!(
-                            "✅ Outbound successfully delivered via Cloudflare SMTPS (Port 465) to {} ({} attachments)",
-                            to_email,
+                            "✅ Outbound successfully delivered via Cloudflare SMTPS (Port 465) to {} recipient(s) ({} attachments)",
+                            all_envelope_rcpts.len(),
                             attachments.len()
                         );
                         return (true, "cloudflare-smtps-port465".to_string());
@@ -975,7 +1034,8 @@ pub async fn dispatch_outbound_email(
                 .json(&serde_json::json!({
                     "from": from_email,
                     "from_name": from_name,
-                    "to": to_email,
+                    "to": primary_rcpt,
+                    "all_recipients": all_envelope_rcpts,
                     "subject": subject,
                     "body_text": body_text,
                     "body_html": body_html,
@@ -995,16 +1055,23 @@ pub async fn dispatch_outbound_email(
     if let Ok(resend_key) = std::env::var("RESEND_API_KEY") {
         let resend_key = resend_key.trim();
         if !resend_key.is_empty() {
+            let mut resend_payload = serde_json::json!({
+                "from": format!("{} <{}>", from_name, from_email),
+                "to": to_emails,
+                "subject": subject,
+                "text": body_text,
+                "html": body_html,
+            });
+            if !cc_emails.is_empty() {
+                resend_payload["cc"] = serde_json::json!(cc_emails);
+            }
+            if !bcc_emails.is_empty() {
+                resend_payload["bcc"] = serde_json::json!(bcc_emails);
+            }
             if let Ok(resp) = client
                 .post("https://api.resend.com/emails")
                 .bearer_auth(resend_key)
-                .json(&serde_json::json!({
-                    "from": format!("{} <{}>", from_name, from_email),
-                    "to": [to_email],
-                    "subject": subject,
-                    "text": body_text,
-                    "html": body_html,
-                }))
+                .json(&resend_payload)
                 .send()
                 .await
             {
@@ -1015,41 +1082,21 @@ pub async fn dispatch_outbound_email(
         }
     }
 
-    // Strategy 4: Direct Brevo HTTPS API (`BREVO_API_KEY`) over Port 443
-    if let Ok(brevo_key) = std::env::var("BREVO_API_KEY") {
-        let brevo_key = brevo_key.trim();
-        if !brevo_key.is_empty() {
-            if let Ok(resp) = client
-                .post("https://api.brevo.com/v3/smtp/email")
-                .header("api-key", brevo_key)
-                .json(&serde_json::json!({
-                    "sender": { "name": from_name, "email": from_email },
-                    "to": [{ "email": to_email }],
-                    "subject": subject,
-                    "textContent": body_text,
-                    "htmlContent": body_html,
-                }))
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    return (true, "brevo-https-api".to_string());
-                }
-            }
+    // Strategy 4: Local Stalwart / Smart Host SMTP Injection
+    let mut any_ok = false;
+    for rcpt in &all_envelope_rcpts {
+        if let Ok(true) = inject_smtp_to_stalwart(
+            stalwart_smtp_addr,
+            from_email,
+            rcpt,
+            raw_mime.as_bytes(),
+        )
+        .await {
+            any_ok = true;
         }
     }
 
-    // Strategy 5: Local Stalwart / Smart Host SMTP Injection
-    let smtp_ok = inject_smtp_to_stalwart(
-        stalwart_smtp_addr,
-        from_email,
-        to_email,
-        raw_mime.as_bytes(),
-    )
-    .await
-    .unwrap_or(false);
-
-    if smtp_ok {
+    if any_ok {
         (true, "stalwart-smtp".to_string())
     } else {
         (false, "local-sent-store".to_string())

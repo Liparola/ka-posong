@@ -208,6 +208,8 @@ export class AppShell extends LitElement {
       const detail = (
         e as CustomEvent<{
           to?: string;
+          cc?: string;
+          bcc?: string;
           subject?: string;
           body?: string;
           inReplyTo?: string;
@@ -219,7 +221,9 @@ export class AppShell extends LitElement {
         detail?.subject ?? '',
         detail?.body ?? '',
         detail?.inReplyTo ?? '',
-        detail?.threadId ?? ''
+        detail?.threadId ?? '',
+        detail?.cc ?? '',
+        detail?.bcc ?? ''
       );
     });
 

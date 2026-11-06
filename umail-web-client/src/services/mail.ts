@@ -78,7 +78,9 @@ class MailService extends EventTarget {
     bodyHtml?: string,
     inReplyTo?: string,
     threadId?: string,
-    attachments?: EmailAttachment[]
+    attachments?: EmailAttachment[],
+    cc?: string,
+    bcc?: string
   ): Promise<{
     status: string;
     delivery_provider?: string;
@@ -96,6 +98,8 @@ class MailService extends EventTarget {
       },
       body: JSON.stringify({
         to,
+        cc: cc && cc.trim() ? cc.trim() : undefined,
+        bcc: bcc && bcc.trim() ? bcc.trim() : undefined,
         subject,
         body_text: bodyText,
         body_html: bodyHtml,

@@ -15,7 +15,9 @@ use std::sync::Arc;
 use crate::{
     arms_webhook::dispatch_tenant_event,
     auth::{verify_umang_jwt, UmangJwtClaims},
-    smtp_injector::{build_multipart_mime, dispatch_outbound_email, AttachmentPayload},
+    smtp_injector::{
+        build_multipart_mime, dispatch_outbound_email, parse_recipient_list, AttachmentPayload,
+    },
     AppState,
 };
 
@@ -49,6 +51,8 @@ pub struct MailMessageDto {
 #[derive(Debug, Deserialize)]
 pub struct SendMailPayload {
     pub to: String,
+    pub cc: Option<String>,
+    pub bcc: Option<String>,
     pub subject: String,
     pub body_text: String,
     pub body_html: Option<String>,
@@ -254,13 +258,34 @@ pub async fn send_umail_message(
     Json(payload): Json<SendMailPayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
-    let recipient = payload.to.trim().to_lowercase();
-    if !recipient.contains('@') {
+
+    let to_emails = parse_recipient_list(&payload.to);
+    if to_emails.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Invalid recipient email address" })),
+            Json(serde_json::json!({ "error": "Please provide at least one valid recipient in 'To'" })),
         ));
     }
+    let cc_emails = payload
+        .cc
+        .as_deref()
+        .map(parse_recipient_list)
+        .unwrap_or_default();
+    let bcc_emails = payload
+        .bcc
+        .as_deref()
+        .map(parse_recipient_list)
+        .unwrap_or_default();
+
+    let mut all_recipients: Vec<String> = Vec::new();
+    for email in to_emails.iter().chain(cc_emails.iter()).chain(bcc_emails.iter()) {
+        let clean = email.trim().to_lowercase();
+        if !clean.is_empty() && !all_recipients.contains(&clean) {
+            all_recipients.push(clean);
+        }
+    }
+
+    let recipient_summary = to_emails.join(", ");
 
     let attachments = payload.attachments.unwrap_or_default();
     let total_attachment_bytes: usize = attachments.iter().map(|a| a.size_bytes).sum();
@@ -308,7 +333,8 @@ pub async fn send_umail_message(
     let raw_mime = build_multipart_mime(
         &claims.name,
         &claims.email,
-        &recipient,
+        &to_emails,
+        &cc_emails,
         &payload.subject,
         &payload.body_text,
         payload.body_html.as_deref(),
@@ -335,7 +361,7 @@ pub async fn send_umail_message(
     .bind(&claims.email)
     .bind(&claims.name)
     .bind(&claims.email)
-    .bind(&recipient)
+    .bind(&recipient_summary)
     .bind(&payload.subject)
     .bind(&preview)
     .bind(&payload.body_text)
@@ -354,39 +380,44 @@ pub async fn send_umail_message(
         )
     })?;
 
-    // 2. If recipient is also a local tenant mailbox, deliver directly into their inbox
-    let local_rcpt = sqlx::query("SELECT tenant_id FROM mailboxes WHERE email = ?")
-        .bind(&recipient)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+    // 2. Deliver directly into inbox of any local tenant mailboxes (To, Cc, Bcc)
+    for rcpt in &all_recipients {
+        if rcpt.eq_ignore_ascii_case(&claims.email) {
+            continue;
+        }
+        let local_rcpt = sqlx::query("SELECT tenant_id FROM mailboxes WHERE email = ?")
+            .bind(rcpt)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
 
-    if let Some(rcpt_row) = local_rcpt {
-        let rcpt_tid: String = rcpt_row.get("tenant_id");
-        let inbox_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
-        let _ = sqlx::query(
-            r#"INSERT INTO mail_messages
-               (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id, has_attachments, attachments)
-               VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Internal DKIM)', ?, ?, ?, ?)"#,
-        )
-        .bind(&inbox_id)
-        .bind(&rcpt_tid)
-        .bind(&recipient)
-        .bind(&claims.name)
-        .bind(&claims.email)
-        .bind(&recipient)
-        .bind(&payload.subject)
-        .bind(&preview)
-        .bind(&payload.body_text)
-        .bind(&payload.body_html)
-        .bind(&raw_mime)
-        .bind(&in_reply_to_clean)
-        .bind(&thread_id)
-        .bind(has_attachments)
-        .bind(&attachments_json)
-        .execute(&state.db)
-        .await;
+        if let Some(rcpt_row) = local_rcpt {
+            let rcpt_tid: String = rcpt_row.get("tenant_id");
+            let inbox_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let _ = sqlx::query(
+                r#"INSERT INTO mail_messages
+                   (id, tenant_id, mailbox_email, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html, raw_mime, is_read, spf_dmarc_status, in_reply_to, thread_id, has_attachments, attachments)
+                   VALUES (?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PASS (Internal DKIM)', ?, ?, ?, ?)"#,
+            )
+            .bind(&inbox_id)
+            .bind(&rcpt_tid)
+            .bind(rcpt)
+            .bind(&claims.name)
+            .bind(&claims.email)
+            .bind(&recipient_summary)
+            .bind(&payload.subject)
+            .bind(&preview)
+            .bind(&payload.body_text)
+            .bind(&payload.body_html)
+            .bind(&raw_mime)
+            .bind(&in_reply_to_clean)
+            .bind(&thread_id)
+            .bind(has_attachments)
+            .bind(&attachments_json)
+            .execute(&state.db)
+            .await;
+        }
     }
 
     // 3. Multi-strategy Outbound Dispatch (Cloudflare REST -> Cloudflare SMTPS 465 -> Stalwart SMTP)
@@ -395,7 +426,9 @@ pub async fn send_umail_message(
         &state.cloudflare_ingress_secret,
         &claims.name,
         &claims.email,
-        &recipient,
+        &to_emails,
+        &cc_emails,
+        &bcc_emails,
         &payload.subject,
         &payload.body_text,
         payload.body_html.as_deref(),
@@ -412,7 +445,9 @@ pub async fn send_umail_message(
         serde_json::json!({
             "message_id": msg_id,
             "from": claims.email,
-            "to": recipient,
+            "to": to_emails,
+            "cc": cc_emails,
+            "bcc": bcc_emails,
             "subject": payload.subject,
             "delivery_provider": delivery_provider
         }),
@@ -423,7 +458,10 @@ pub async fn send_umail_message(
         "status": if injected { "SENT" } else { "QUEUED_LOCALLY" },
         "message_id": msg_id,
         "from": claims.email,
-        "to": recipient,
+        "to": to_emails,
+        "cc": cc_emails,
+        "bcc": bcc_emails,
+        "recipient_summary": recipient_summary,
         "relayed_externally": injected,
         "stalwart_relayed": injected,
         "delivery_provider": delivery_provider
