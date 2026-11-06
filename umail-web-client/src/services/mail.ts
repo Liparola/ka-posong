@@ -138,6 +138,41 @@ class MailService extends EventTarget {
 
     this.dispatchEvent(new CustomEvent('mail-updated'));
   }
+
+  async emptyTrash(): Promise<{ status: string; purged_count: number }> {
+    const token = authService.getToken();
+    if (!token) throw new Error('Not authenticated');
+
+    const res = await fetch(`${authService.getApiBase()}/api/umail/trash`, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    if (!res.ok) {
+      const err = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(err.error ?? `Failed to empty trash (${res.status})`);
+    }
+
+    const result = (await res.json()) as { status: string; purged_count: number };
+    this.dispatchEvent(new CustomEvent('mail-updated'));
+    return result;
+  }
+
+  async deleteMessagePermanently(id: string): Promise<void> {
+    const token = authService.getToken();
+    if (!token) return;
+
+    await fetch(`${authService.getApiBase()}/api/umail/messages/${id}`, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    this.dispatchEvent(new CustomEvent('mail-updated'));
+  }
 }
 
 export const mailService = new MailService();

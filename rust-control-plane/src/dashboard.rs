@@ -143,6 +143,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
     let mut mailbox_rows_html = String::new();
     for m in &mailboxes {
         let email: String = m.get("email");
+        let tid: String = m.get("tenant_id");
         let phone: String = m.get("phone");
         let name: String = m.get("display_name");
         let role: String = m.get("role");
@@ -155,12 +156,18 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 <td class="py-2.5 px-4 font-mono text-sm text-purple-700 font-semibold">{phone}</td>
                 <td class="py-2.5 px-4 text-sm text-slate-700">{name} <span class="text-xs uppercase px-1.5 py-0.5 bg-slate-100 rounded ml-1">{role}</span></td>
                 <td class="py-2.5 px-4 text-xs text-emerald-700 font-medium">{channel}</td>
+                <td class="py-2.5 px-4">
+                    <button onclick="deleteMailbox('{email}', '{tid}')" class="px-2.5 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded text-xs font-bold transition inline-flex items-center gap-1">
+                        🗑️ Delete
+                    </button>
+                </td>
             </tr>"#,
             email = email,
             phone = phone,
             name = name,
             role = role,
-            channel = channel
+            channel = channel,
+            tid = tid
         ));
     }
 
@@ -318,6 +325,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                             <th class="py-3 px-4">Bound Lesotho Phone (UMANG ID)</th>
                             <th class="py-3 px-4">Display Name &amp; Role</th>
                             <th class="py-3 px-4">OTP Delivery Channel</th>
+                            <th class="py-3 px-4">Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -645,6 +653,26 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 window.location.reload();
             }} else {{
                 alert('Error: ' + (await resp.text()));
+            }}
+        }}
+
+        async function deleteMailbox(email, tid) {{
+            if (!confirm(`Are you sure you want to permanently delete mailbox "${{email}}"?\n\nThis will remove the mailbox, unbind the phone from UMANG, and purge all its messages.`)) {{
+                return;
+            }}
+            try {{
+                const resp = await fetch(`/api/v1/mailboxes/${{email}}`, {{
+                    method: 'DELETE',
+                    headers: {{ 'X-API-Key': '{master_key}' }}
+                }});
+                if (resp.ok) {{
+                    alert(`Mailbox "${{email}}" has been permanently deleted.`);
+                    window.location.reload();
+                }} else {{
+                    alert('Error deleting mailbox: ' + (await resp.text()));
+                }}
+            }} catch (err) {{
+                alert('Request failed: ' + err.message);
             }}
         }}
 

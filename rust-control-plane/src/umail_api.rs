@@ -477,3 +477,64 @@ pub async fn patch_umail_message(
         "id": msg_id
     })))
 }
+
+/// DELETE /api/umail/trash
+/// Permanently purges all messages in the 'trash' folder for the authenticated mailbox
+pub async fn empty_umail_trash_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+
+    let result = sqlx::query("DELETE FROM mail_messages WHERE mailbox_email = ? AND folder = 'trash'")
+        .bind(&claims.email)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let purged_count = result.rows_affected();
+    tracing::info!(
+        "🗑️ Permanently emptied trash for mailbox {}: {} message(s) purged",
+        claims.email,
+        purged_count
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "TRASH_EMPTIED",
+        "mailbox": claims.email,
+        "purged_count": purged_count
+    })))
+}
+
+/// DELETE /api/umail/messages/:id
+/// Permanently deletes a single message for the authenticated mailbox
+pub async fn delete_umail_message(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(msg_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+
+    let result = sqlx::query("DELETE FROM mail_messages WHERE mailbox_email = ? AND id = ?")
+        .bind(&claims.email)
+        .bind(&msg_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "status": "DELETED",
+        "id": msg_id,
+        "rows_affected": result.rows_affected()
+    })))
+}

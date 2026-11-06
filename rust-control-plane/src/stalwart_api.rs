@@ -36,6 +36,8 @@ pub trait StalwartClient: Send + Sync {
     ) -> Result<bool, String>;
 
     async fn update_domain_quota(&self, domain: &str, quota_bytes: i64) -> Result<bool, String>;
+
+    async fn delete_mailbox(&self, email: &str) -> Result<bool, String>;
 }
 
 pub struct HttpStalwartClient {
@@ -194,6 +196,27 @@ impl StalwartClient for HttpStalwartClient {
         {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
+        }
+    }
+
+    async fn delete_mailbox(&self, email: &str) -> Result<bool, String> {
+        let url = format!("{}/api/principal/{}", self.api_url.trim_end_matches('/'), email);
+        match self
+            .http
+            .delete(&url)
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp.status().is_success() || resp.status().as_u16() == 404),
+            Err(e) => {
+                tracing::warn!(
+                    "[StalwartClient] Delete principal {} offline or error: {}",
+                    email,
+                    e
+                );
+                Ok(false)
+            }
         }
     }
 }

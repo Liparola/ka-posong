@@ -148,6 +148,51 @@ export class ViewMailbox extends LitElement {
       border-color: #6200ee;
     }
 
+    .btn-action.btn-danger {
+      border-color: #fecdd3;
+      color: #e11d48;
+      background: #fff1f2;
+    }
+
+    .btn-action.btn-danger:hover {
+      background: #ffe4e6;
+      border-color: #fda4af;
+    }
+
+    .trash-banner {
+      background: #fff1f2;
+      border: 1px solid #fecdd3;
+      border-radius: 10px;
+      padding: 10px 16px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 0.85rem;
+      color: #9f1239;
+    }
+
+    .btn-empty-trash {
+      background: #e11d48;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 6px 14px;
+      font-weight: 700;
+      font-size: 0.82rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s;
+      white-space: nowrap;
+    }
+
+    .btn-empty-trash:hover {
+      background: #be123c;
+    }
+
     .split-pane {
       flex: 1;
       display: grid;
@@ -1003,6 +1048,54 @@ export class ViewMailbox extends LitElement {
     await this.loadFolder();
   }
 
+  private async _confirmEmptyTrash() {
+    if (
+      !confirm(
+        'Are you sure you want to permanently delete all messages in Trash?\n\n' +
+        'This will permanently purge all trashed messages and attachments from local and cloud storage. ' +
+        'This action cannot be undone.'
+      )
+    ) {
+      return;
+    }
+    try {
+      this.loading = true;
+      const res = await mailService.emptyTrash();
+      this.toastMessage = `Trash emptied permanently. ${res.purged_count} message(s) deleted.`;
+      this.toastType = 'success';
+      this.selectedThread = null;
+      await this.loadFolder();
+    } catch (err: any) {
+      this.toastMessage = `Failed to empty trash: ${err.message}`;
+      this.toastType = 'error';
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  private async _confirmDeleteThreadPermanently(thread: EmailThread) {
+    if (
+      !confirm(
+        'Are you sure you want to permanently delete this conversation and all its messages?\n\n' +
+        'This will permanently purge this conversation from cloud storage. This action cannot be undone.'
+      )
+    ) {
+      return;
+    }
+    try {
+      for (const m of thread.messages) {
+        await mailService.deleteMessagePermanently(m.id);
+      }
+      this.toastMessage = 'Conversation permanently deleted.';
+      this.toastType = 'success';
+      this.selectedThread = null;
+      await this.loadFolder();
+    } catch (err: any) {
+      this.toastMessage = `Failed to delete conversation: ${err.message}`;
+      this.toastType = 'error';
+    }
+  }
+
   private _openFullComposeForReply(thread: EmailThread) {
     const user = authService.getUser();
     const latest = thread.latestMessage;
@@ -1205,8 +1298,28 @@ export class ViewMailbox extends LitElement {
             }}
           />
         </div>
+        ${this.folder === 'trash' && this.threads.length > 0
+          ? html`
+              <button
+                class="btn-action btn-danger"
+                @click=${() => this._confirmEmptyTrash()}>
+                🗑️ Empty Trash Now
+              </button>
+            `
+          : ''}
         <button class="btn-action" @click=${() => this.loadFolder()}>↻ Refresh</button>
       </div>
+
+      ${this.folder === 'trash' && this.threads.length > 0
+        ? html`
+            <div class="trash-banner">
+              <span>⚠️ Messages in Trash can be permanently purged. This will delete all trashed messages and attachments from local and cloud storage.</span>
+              <button class="btn-empty-trash" @click=${() => this._confirmEmptyTrash()}>
+                🗑️ Empty Trash Now
+              </button>
+            </div>
+          `
+        : ''}
 
       <div class="split-pane">
         <!-- Thread Conversation List Pane -->
@@ -1264,12 +1377,35 @@ export class ViewMailbox extends LitElement {
                   <div class="thread-meta-bar">
                     <span class="thread-tag">🧵 ${thread.messages.length} messages in conversation</span>
                     <span class="thread-tag">Cloudflare Verified Domain</span>
-                    <button class="btn-action" style="padding: 2px 8px; font-size: 0.75rem;" @click=${() => this._moveThreadFolder(thread, 'archive')}>
-                      📥 Archive
-                    </button>
-                    <button class="btn-action" style="padding: 2px 8px; font-size: 0.75rem;" @click=${() => this._moveThreadFolder(thread, 'trash')}>
-                      🗑 Trash
-                    </button>
+                    ${this.folder === 'trash'
+                      ? html`
+                          <button
+                            class="btn-action"
+                            style="padding: 2px 8px; font-size: 0.75rem;"
+                            @click=${() => this._moveThreadFolder(thread, 'inbox')}>
+                            ↩ Restore to Inbox
+                          </button>
+                          <button
+                            class="btn-action btn-danger"
+                            style="padding: 2px 8px; font-size: 0.75rem;"
+                            @click=${() => this._confirmDeleteThreadPermanently(thread)}>
+                            ❌ Delete Permanently
+                          </button>
+                        `
+                      : html`
+                          <button
+                            class="btn-action"
+                            style="padding: 2px 8px; font-size: 0.75rem;"
+                            @click=${() => this._moveThreadFolder(thread, 'archive')}>
+                            📥 Archive
+                          </button>
+                          <button
+                            class="btn-action"
+                            style="padding: 2px 8px; font-size: 0.75rem;"
+                            @click=${() => this._moveThreadFolder(thread, 'trash')}>
+                            🗑 Trash
+                          </button>
+                        `}
                   </div>
                 </div>
 

@@ -18,7 +18,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware,
     response::{Json, Redirect},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -38,7 +38,8 @@ use crate::{
     stalwart_api::{HttpStalwartClient, StalwartClient},
     tiers::BusinessTier,
     umail_api::{
-        get_umail_thread, list_umail_messages, patch_umail_message, send_umail_message,
+        delete_umail_message, empty_umail_trash_handler, get_umail_thread, list_umail_messages,
+        patch_umail_message, send_umail_message,
     },
     umang_auth::{
         normalize_lesotho_phone, request_otp_handler, verify_otp_handler, CachedOtpEntry,
@@ -902,6 +903,104 @@ async fn create_mailbox_handler(
     })))
 }
 
+async fn delete_mailbox_internal(
+    state: Arc<AppState>,
+    auth: AuthContext,
+    email: String,
+    expected_tid: Option<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let email = email.trim().to_lowercase();
+    let mbx = sqlx::query("SELECT tenant_id FROM mailboxes WHERE email = ?")
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("Mailbox {} not found", email) })),
+            )
+        })?;
+
+    let tenant_id: String = mbx.get("tenant_id");
+    if let Some(ref exp_tid) = expected_tid {
+        if exp_tid != &tenant_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Mailbox does not belong to specified tenant" })),
+            ));
+        }
+    }
+
+    match &auth.role {
+        Role::DevOpsMaster => {}
+        Role::TenantAdmin { tenant_id: tid } if tid == &tenant_id => {}
+        _ => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Insufficient permissions to delete mailbox for this tenant" })),
+            ));
+        }
+    }
+
+    let _ = state.stalwart.delete_mailbox(&email).await;
+
+    let msg_del = sqlx::query("DELETE FROM mail_messages WHERE mailbox_email = ?")
+        .bind(&email)
+        .execute(&state.db)
+        .await
+        .map(|r| r.rows_affected())
+        .unwrap_or(0);
+
+    sqlx::query("DELETE FROM mailboxes WHERE email = ?")
+        .bind(&email)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    tracing::info!(
+        "🗑️ Deleted mailbox {} for tenant {} (purged {} messages)",
+        email,
+        tenant_id,
+        msg_del
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "MAILBOX_DELETED",
+        "email": email,
+        "tenant_id": tenant_id,
+        "purged_messages": msg_del
+    })))
+}
+
+/// DELETE /api/v1/mailboxes/:email
+async fn delete_mailbox_direct_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Path(email): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    delete_mailbox_internal(state, auth, email, None).await
+}
+
+/// DELETE /api/v1/tenants/:id/mailboxes/:email
+async fn delete_tenant_mailbox_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Path((tenant_id, email)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    delete_mailbox_internal(state, auth, email, Some(tenant_id)).await
+}
+
 /// POST /api/v1/arms/register
 async fn register_arm_handler(
     State(state): State<Arc<AppState>>,
@@ -1544,7 +1643,18 @@ async fn main() {
             "/api/v1/tenants/:id/mailboxes",
             post(create_mailbox_handler),
         )
-        .route("/api/v1/mailboxes", post(create_mailbox_handler))
+        .route(
+            "/api/v1/tenants/:id/mailboxes/:email",
+            delete(delete_tenant_mailbox_handler),
+        )
+        .route(
+            "/api/v1/mailboxes",
+            post(create_mailbox_handler),
+        )
+        .route(
+            "/api/v1/mailboxes/:email",
+            delete(delete_mailbox_direct_handler),
+        )
         .route("/api/v1/arms/register", post(register_arm_handler))
         .route(
             "/api/v1/admin/arms/:id/toggle",
@@ -1582,7 +1692,11 @@ async fn main() {
         .route("/api/umail/messages", get(list_umail_messages))
         .route("/api/umail/thread/:id", get(get_umail_thread))
         .route("/api/umail/send", post(send_umail_message))
-        .route("/api/umail/messages/:id", patch(patch_umail_message))
+        .route(
+            "/api/umail/messages/:id",
+            patch(patch_umail_message).delete(delete_umail_message),
+        )
+        .route("/api/umail/trash", delete(empty_umail_trash_handler))
         .route("/api/v1/domains/:domain/dns", get(get_domain_dns_handler))
         .route("/ops", get(render_ops_dashboard))
         .route("/ops-dashboard", get(render_ops_dashboard))
