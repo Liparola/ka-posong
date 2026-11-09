@@ -49,10 +49,15 @@ export class ViewMailbox extends LitElement {
   @state() private toastType: 'success' | 'warning' | 'error' = 'success';
   private _toastTimeout?: number;
 
+  // Mobile Master-Detail State (Gmail Android UX: list-only vs detail-only on mobile)
+  @state() private mobileReaderOpen = false;
+
   @query('#inline-reply-file-input') private inlineFileInputEl?: HTMLInputElement;
 
   private _mailUpdateHandler!: () => void;
   private _emailSentHandler!: (e: Event) => void;
+  private _closeMobileReaderHandler!: () => void;
+  private _popStateHandler!: () => void;
 
   static styles = css`
     :host {
@@ -61,6 +66,15 @@ export class ViewMailbox extends LitElement {
       height: 100%;
       box-sizing: border-box;
       overflow: hidden;
+    }
+
+    .mailbox-shell {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      width: 100%;
+      overflow: hidden;
+      position: relative;
     }
 
     .org-banner {
@@ -898,6 +912,352 @@ export class ViewMailbox extends LitElement {
       justify-content: flex-end;
       gap: 10px;
     }
+
+    .msg-bottom-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .msg-star-btn {
+      background: transparent;
+      border: none;
+      padding: 0 2px;
+      font-size: 1.15rem;
+      line-height: 1;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: transform 0.12s ease;
+    }
+
+    .msg-star-btn:hover {
+      transform: scale(1.18);
+    }
+
+    .date-dot-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .unread-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #1a73e8;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    /* Mobile-only elements hidden on desktop (>= 900px) */
+    .mobile-folder-heading,
+    .mobile-compose-fab,
+    .mobile-reader-topbar {
+      display: none;
+    }
+
+    /* ============================================================================
+       GMAIL ANDROID MOBILE VIEW (< 900px)
+       Single-pane Master-Detail architecture:
+       - List mode: Full-screen scrollable conversation list + floating Compose pill
+       - Reader mode: Full-screen thread reader with sticky back/action toolbar
+       ============================================================================ */
+    @media (max-width: 899px) {
+      .mailbox-shell {
+        background: #fff;
+      }
+
+      /* Compact 1-line tenant strip on mobile so list gets maximum screen height */
+      .org-banner {
+        margin: 8px 12px 4px 12px;
+        padding: 8px 14px;
+        border-radius: 10px;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+
+      .org-banner h3 {
+        font-size: 0.88rem;
+      }
+
+      .org-banner small {
+        display: none;
+      }
+
+      .plan-badge {
+        font-size: 0.66rem;
+        padding: 3px 9px;
+      }
+
+      /* Gmail Android Pill Search Bar on mobile */
+      .toolbar {
+        margin: 4px 12px 4px 12px;
+        gap: 8px;
+        flex-shrink: 0;
+      }
+
+      .search-box {
+        background: #eef1f8;
+        border: none;
+        border-radius: 28px;
+        padding: 10px 16px;
+        box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.03);
+      }
+
+      .search-box input {
+        background: transparent;
+        font-size: 0.94rem;
+        color: #1f1f1f;
+      }
+
+      .search-box input::placeholder {
+        color: #5f6368;
+      }
+
+      .toolbar .btn-action {
+        border-radius: 20px;
+        padding: 8px 12px;
+        font-size: 0.78rem;
+        background: #eef1f8;
+        border: none;
+        color: #444746;
+      }
+
+      .trash-banner {
+        margin: 4px 12px 6px 12px;
+        padding: 8px 12px;
+        font-size: 0.78rem;
+        flex-shrink: 0;
+      }
+
+      /* Gmail Android Category / Folder Label */
+      .mobile-folder-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 16px 4px 16px;
+        font-size: 0.76rem;
+        font-weight: 600;
+        color: #5f6368;
+        letter-spacing: 0.02em;
+        flex-shrink: 0;
+      }
+
+      .split-pane {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        gap: 0;
+        overflow: hidden;
+      }
+
+      /* LIST MODE on Mobile: Hide reader-pane completely, give message-list 100% height */
+      .mailbox-shell.mobile-list-open .reader-pane {
+        display: none !important;
+      }
+
+      .mailbox-shell.mobile-list-open .message-list {
+        flex: 1;
+        height: 100%;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        overflow-y: auto;
+        padding-bottom: 88px;
+        overscroll-behavior: contain;
+      }
+
+      /* Gmail Android Conversation Row Styling */
+      .msg-row {
+        padding: 12px 16px;
+        gap: 14px;
+        border-bottom: none;
+        border-left: none;
+        align-items: flex-start;
+      }
+
+      .msg-row.active {
+        background: transparent;
+      }
+
+      .msg-row.unread {
+        background: #fff;
+      }
+
+      .msg-row:active {
+        background: #f2f4fa;
+      }
+
+      .avatar-circle {
+        width: 42px;
+        height: 42px;
+        font-size: 0.95rem;
+        font-weight: 600;
+        margin-top: 2px;
+      }
+
+      .msg-top {
+        margin-bottom: 2px;
+      }
+
+      .sender {
+        font-size: 0.96rem;
+        font-weight: 500;
+        color: #1f1f1f;
+      }
+
+      .msg-row.unread .sender {
+        font-weight: 700;
+        color: #000;
+      }
+
+      .date {
+        font-size: 0.76rem;
+        color: #444746;
+      }
+
+      .msg-row.unread .date {
+        color: #1f1f1f;
+        font-weight: 700;
+      }
+
+      .subject {
+        font-size: 0.88rem;
+        font-weight: 400;
+        color: #444746;
+        margin-bottom: 2px;
+      }
+
+      .msg-row.unread .subject {
+        font-weight: 700;
+        color: #1f1f1f;
+      }
+
+      .preview {
+        font-size: 0.84rem;
+        color: #5f6368;
+      }
+
+      /* Floating Gmail Android Compose Pill Button on Mobile */
+      .mailbox-shell.mobile-list-open .mobile-compose-fab {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        z-index: 30;
+        background: #e8def8;
+        color: #1d192b;
+        border: none;
+        border-radius: 16px;
+        padding: 14px 20px;
+        font-size: 0.95rem;
+        font-weight: 600;
+        box-shadow: 0 4px 14px rgba(29, 25, 43, 0.22);
+        cursor: pointer;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+      }
+
+      .mailbox-shell.mobile-list-open .mobile-compose-fab:active {
+        transform: scale(0.96);
+      }
+
+      /* READER MODE on Mobile: Hide list & top bars, give reader-pane 100% height */
+      .mailbox-shell.mobile-reader-open .org-banner,
+      .mailbox-shell.mobile-reader-open .toolbar,
+      .mailbox-shell.mobile-reader-open .trash-banner,
+      .mailbox-shell.mobile-reader-open .mobile-folder-heading,
+      .mailbox-shell.mobile-reader-open .message-list,
+      .mailbox-shell.mobile-reader-open .mobile-compose-fab {
+        display: none !important;
+      }
+
+      .mailbox-shell.mobile-reader-open .reader-pane {
+        flex: 1;
+        height: 100%;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        padding: 0 14px 28px 14px;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+      }
+
+      /* Sticky Top Action Bar inside Mobile Thread Reader */
+      .mobile-reader-topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        position: sticky;
+        top: 0;
+        z-index: 15;
+        background: rgba(255, 255, 255, 0.96);
+        backdrop-filter: blur(6px);
+        margin: 0 -14px;
+        padding: 10px 12px;
+        border-bottom: 1px solid #f0f0f5;
+      }
+
+      .btn-mobile-back {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: transparent;
+        border: none;
+        color: #1f1f1f;
+        font-size: 0.95rem;
+        font-weight: 600;
+        padding: 6px 10px;
+        border-radius: 20px;
+        cursor: pointer;
+      }
+
+      .btn-mobile-back:active {
+        background: #f0f0f5;
+      }
+
+      .mobile-reader-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .thread-header {
+        padding-top: 8px;
+      }
+
+      .thread-title-row {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+      }
+
+      .thread-title-row h2 {
+        font-size: 1.2rem;
+        line-height: 1.35;
+        word-break: break-word;
+      }
+
+      .msg-card-expanded {
+        padding: 14px 12px;
+      }
+
+      .sender-card {
+        padding: 10px 12px;
+      }
+
+      .meta-grid {
+        grid-template-columns: 1fr;
+        gap: 4px;
+      }
+
+      .inline-reply-box {
+        padding: 12px 14px;
+      }
+    }
   `;
 
   connectedCallback() {
@@ -913,6 +1273,18 @@ export class ViewMailbox extends LitElement {
     };
     window.addEventListener('email-sent', this._emailSentHandler);
 
+    this._closeMobileReaderHandler = () => {
+      this.mobileReaderOpen = false;
+    };
+    window.addEventListener('close-mobile-reader', this._closeMobileReaderHandler);
+
+    this._popStateHandler = () => {
+      if (this.mobileReaderOpen) {
+        this.mobileReaderOpen = false;
+      }
+    };
+    window.addEventListener('popstate', this._popStateHandler);
+
     this.loadFolder();
   }
 
@@ -920,6 +1292,8 @@ export class ViewMailbox extends LitElement {
     super.disconnectedCallback();
     mailService.removeEventListener('mail-updated', this._mailUpdateHandler);
     window.removeEventListener('email-sent', this._emailSentHandler);
+    window.removeEventListener('close-mobile-reader', this._closeMobileReaderHandler);
+    window.removeEventListener('popstate', this._popStateHandler);
     if (this._toastTimeout) clearTimeout(this._toastTimeout);
   }
 
@@ -935,9 +1309,60 @@ export class ViewMailbox extends LitElement {
   updated(changed: Map<string, unknown>) {
     if (changed.has('folder')) {
       this.selectedThread = null;
+      this.mobileReaderOpen = false;
       this.loadFolder();
     }
     this._syncAllRichBodies();
+  }
+
+  private _getAvatarBg(seed: string): string {
+    const palette = [
+      '#ab47bc', // Orchid Purple (L)
+      '#7986cb', // Indigo Lavender (M)
+      '#66bb6a', // Sage Green (R)
+      '#5c6bc0', // Slate Blue (S)
+      '#26c6da', // Cyan Sky (B)
+      '#ec407a', // Rose
+      '#26a69a', // Teal
+      '#7e57c2', // Deep Purple
+      '#ffa726', // Amber
+    ];
+    let hash = 0;
+    for (let i = 0; i < seed.length; i++) {
+      hash = seed.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return palette[Math.abs(hash) % palette.length];
+  }
+
+  private _getFolderLabel(): string {
+    switch (this.folder) {
+      case 'inbox':
+        return 'Primary';
+      case 'sent':
+        return 'Sent';
+      case 'starred':
+        return 'Starred';
+      case 'archive':
+        return 'Archive';
+      case 'trash':
+        return 'Trash';
+      default:
+        return this.folder;
+    }
+  }
+
+  private _closeMobileReader() {
+    this.mobileReaderOpen = false;
+  }
+
+  private _openMobileCompose() {
+    this.dispatchEvent(
+      new CustomEvent('open-compose', {
+        detail: {},
+        bubbles: true,
+        composed: true,
+      })
+    );
   }
 
   private _syncAllRichBodies() {
@@ -1009,6 +1434,17 @@ export class ViewMailbox extends LitElement {
     this.inlineReplyError = '';
     this.expandedMessageIds = new Set([thread.latestMessage.id]);
 
+    if (typeof window !== 'undefined' && window.innerWidth < 900 && !this.mobileReaderOpen) {
+      this.mobileReaderOpen = true;
+      try {
+        window.history.pushState({ umailMobileReader: true }, '');
+      } catch {
+        // Ignore history pushState restrictions
+      }
+    } else {
+      this.mobileReaderOpen = true;
+    }
+
     // Mark unread messages in this thread as read
     for (const m of thread.messages) {
       if (!m.is_read) {
@@ -1045,6 +1481,7 @@ export class ViewMailbox extends LitElement {
       await mailService.updateMessage(m.id, { folder: targetFolder });
     }
     this.selectedThread = null;
+    this.mobileReaderOpen = false;
     await this.loadFolder();
   }
 
@@ -1064,6 +1501,7 @@ export class ViewMailbox extends LitElement {
       this.toastMessage = `Trash emptied permanently. ${res.purged_count} message(s) deleted.`;
       this.toastType = 'success';
       this.selectedThread = null;
+      this.mobileReaderOpen = false;
       await this.loadFolder();
     } catch (err: any) {
       this.toastMessage = `Failed to empty trash: ${err.message}`;
@@ -1089,6 +1527,7 @@ export class ViewMailbox extends LitElement {
       this.toastMessage = 'Conversation permanently deleted.';
       this.toastType = 'success';
       this.selectedThread = null;
+      this.mobileReaderOpen = false;
       await this.loadFolder();
     } catch (err: any) {
       this.toastMessage = `Failed to delete conversation: ${err.message}`;
@@ -1262,114 +1701,181 @@ export class ViewMailbox extends LitElement {
     const thread = this.selectedThread;
 
     return html`
-      ${this.toastMessage
-        ? html`
-            <div class="sent-toast ${this.toastType}">
-              <span>${this.toastMessage}</span>
-              <button
-                style="background:transparent; border:none; color:#fff; cursor:pointer; font-weight:bold; font-size:1.1rem; line-height:1;"
-                @click=${() => (this.toastMessage = '')}>
-                &times;
-              </button>
-            </div>
-          `
-        : ''}
-
-      <div class="org-banner">
-        <div>
-          <h3>${user?.email ?? 'uMail Inbox'}</h3>
-          <small>
-            UMANG Phone ID: ${user?.phone ?? ''} • Domain: ${user?.domain ?? 'liparola.org'} •
-            Cloudflare Email Routing &amp; Sending (Beta)
-          </small>
-        </div>
-        <span class="plan-badge">${user?.subscription ?? 'ENTERPRISE'} TIER</span>
-      </div>
-
-      <div class="toolbar">
-        <div class="search-box">
-          <input
-            type="search"
-            placeholder="Search conversations in ${this.folder}..."
-            .value=${this.searchQuery}
-            @input=${(e: Event) => {
-              this.searchQuery = (e.target as HTMLInputElement).value;
-              this.loadFolder();
-            }}
-          />
-        </div>
-        ${this.folder === 'trash' && this.threads.length > 0
+      <div class="mailbox-shell ${this.mobileReaderOpen ? 'mobile-reader-open' : 'mobile-list-open'}">
+        ${this.toastMessage
           ? html`
-              <button
-                class="btn-action btn-danger"
-                @click=${() => this._confirmEmptyTrash()}>
-                🗑️ Empty Trash Now
-              </button>
+              <div class="sent-toast ${this.toastType}">
+                <span>${this.toastMessage}</span>
+                <button
+                  style="background:transparent; border:none; color:#fff; cursor:pointer; font-weight:bold; font-size:1.1rem; line-height:1;"
+                  @click=${() => (this.toastMessage = '')}>
+                  &times;
+                </button>
+              </div>
             `
           : ''}
-        <button class="btn-action" @click=${() => this.loadFolder()}>↻ Refresh</button>
-      </div>
 
-      ${this.folder === 'trash' && this.threads.length > 0
-        ? html`
-            <div class="trash-banner">
-              <span>⚠️ Messages in Trash can be permanently purged. This will delete all trashed messages and attachments from local and cloud storage.</span>
-              <button class="btn-empty-trash" @click=${() => this._confirmEmptyTrash()}>
-                🗑️ Empty Trash Now
-              </button>
-            </div>
-          `
-        : ''}
-
-      <div class="split-pane">
-        <!-- Thread Conversation List Pane -->
-        <div class="message-list">
-          ${this.loading
-            ? html`<div class="empty-state">Syncing conversations with Cloudflare &amp; Stalwart...</div>`
-            : this.threads.length === 0
-            ? html`<div class="empty-state">No conversations in <strong>${this.folder}</strong>.</div>`
-            : this.threads.map((t) => {
-                const latest = t.latestMessage;
-                const isSelected = thread?.threadKey === t.threadKey;
-                return html`
-                  <div
-                    class="msg-row ${t.unreadCount > 0 ? 'unread' : ''} ${isSelected ? 'active' : ''}"
-                    @click=${() => this._selectThread(t)}>
-                    <div class="avatar-circle">${latest.senderInitials}</div>
-                    <div class="msg-content">
-                      <div class="msg-top">
-                        <span class="sender">
-                          <span
-                            @click=${(e: Event) => this._toggleStar(t, e)}
-                            style="color:${t.isStarred ? '#f59e0b' : '#ccc'}; cursor: pointer;">
-                            ★
-                          </span>
-                          ${t.participantsSummary}
-                          ${t.hasReplies
-                            ? html`<span class="thread-pill">🧵 ${t.messages.length}</span>`
-                            : ''}
-                          ${t.participants.some((p) => p.isSelf)
-                            ? html`<span class="replied-tag">↩ Replied</span>`
-                            : ''}
-                          ${t.messages.some((m) => m.has_attachments || (m.attachments && m.attachments.length > 0))
-                            ? html`<span class="thread-pill" style="background:#eef2ff;color:#4338ca;">📎 Attached</span>`
-                            : ''}
-                        </span>
-                        <span class="date">${t.lastDateShort}</span>
-                      </div>
-                      <div class="subject">${t.cleanSubject}</div>
-                      <div class="preview">${latest.cleanPreview}</div>
-                    </div>
-                  </div>
-                `;
-              })}
+        <div class="org-banner">
+          <div>
+            <h3>${user?.email ?? 'uMail Inbox'}</h3>
+            <small>
+              UMANG Phone ID: ${user?.phone ?? ''} • Domain: ${user?.domain ?? 'liparola.org'} •
+              Cloudflare Email Routing &amp; Sending (Beta)
+            </small>
+          </div>
+          <span class="plan-badge">${user?.subscription ?? 'ENTERPRISE'} TIER</span>
         </div>
 
-        <!-- Conversation Reader Pane -->
-        <div class="reader-pane">
-          ${thread
+        <div class="toolbar">
+          <div class="search-box">
+            <input
+              type="search"
+              placeholder="Search in emails"
+              .value=${this.searchQuery}
+              @input=${(e: Event) => {
+                this.searchQuery = (e.target as HTMLInputElement).value;
+                this.loadFolder();
+              }}
+            />
+          </div>
+          ${this.folder === 'trash' && this.threads.length > 0
             ? html`
-                <div class="thread-header">
+                <button
+                  class="btn-action btn-danger"
+                  @click=${() => this._confirmEmptyTrash()}>
+                  🗑️ Empty Trash Now
+                </button>
+              `
+            : ''}
+          <button class="btn-action" @click=${() => this.loadFolder()}>↻ Refresh</button>
+        </div>
+
+        ${this.folder === 'trash' && this.threads.length > 0
+          ? html`
+              <div class="trash-banner">
+                <span>⚠️ Messages in Trash can be permanently purged. This will delete all trashed messages and attachments from local and cloud storage.</span>
+                <button class="btn-empty-trash" @click=${() => this._confirmEmptyTrash()}>
+                  🗑️ Empty Trash Now
+                </button>
+              </div>
+            `
+          : ''}
+
+        <!-- Gmail Android Category / Folder Label on Mobile -->
+        <div class="mobile-folder-heading">
+          <span>${this._getFolderLabel()}</span>
+          <span>${this.threads.length} ${this.threads.length === 1 ? 'conversation' : 'conversations'}</span>
+        </div>
+
+        <div class="split-pane">
+          <!-- Thread Conversation List Pane -->
+          <div class="message-list">
+            ${this.loading
+              ? html`<div class="empty-state">Syncing conversations with Cloudflare &amp; Stalwart...</div>`
+              : this.threads.length === 0
+              ? html`<div class="empty-state">No conversations in <strong>${this.folder}</strong>.</div>`
+              : this.threads.map((t) => {
+                  const latest = t.latestMessage;
+                  const isSelected = thread?.threadKey === t.threadKey;
+                  const avatarColor = this._getAvatarBg(latest.senderDisplayName || latest.senderInitials);
+                  return html`
+                    <div
+                      class="msg-row ${t.unreadCount > 0 ? 'unread' : ''} ${isSelected ? 'active' : ''}"
+                      @click=${() => this._selectThread(t)}>
+                      <div class="avatar-circle" style="background: ${avatarColor};">${latest.senderInitials}</div>
+                      <div class="msg-content">
+                        <div class="msg-top">
+                          <span class="sender">
+                            ${t.participantsSummary}
+                            ${t.hasReplies
+                              ? html`<span class="thread-pill">${t.messages.length}</span>`
+                              : ''}
+                            ${t.participants.some((p) => p.isSelf)
+                              ? html`<span class="replied-tag">↩ Replied</span>`
+                              : ''}
+                            ${t.messages.some((m) => m.has_attachments || (m.attachments && m.attachments.length > 0))
+                              ? html`<span class="thread-pill" style="background:#eef2ff;color:#4338ca;">📎</span>`
+                              : ''}
+                          </span>
+                          <span class="date-dot-group">
+                            <span class="date">${t.lastDateShort}</span>
+                            ${t.unreadCount > 0
+                              ? html`<span class="unread-dot" title="Unread message"></span>`
+                              : ''}
+                          </span>
+                        </div>
+                        <div class="subject">${t.cleanSubject}</div>
+                        <div class="msg-bottom-row">
+                          <div class="preview">${latest.cleanPreview}</div>
+                          <button
+                            type="button"
+                            class="msg-star-btn"
+                            style="color:${t.isStarred ? '#f59e0b' : '#b0b4be'};"
+                            title="${t.isStarred ? 'Starred' : 'Not starred'}"
+                            @click=${(e: Event) => this._toggleStar(t, e)}>
+                            ${t.isStarred ? '★' : '☆'}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  `;
+                })}
+          </div>
+
+          <!-- Conversation Reader Pane -->
+          <div class="reader-pane">
+            ${thread
+              ? html`
+                  <!-- Gmail Android Mobile Top Action Bar (only visible on < 900px) -->
+                  <div class="mobile-reader-topbar">
+                    <button
+                      type="button"
+                      class="btn-mobile-back"
+                      @click=${() => this._closeMobileReader()}
+                      aria-label="Back to conversation list">
+                      ← Back
+                    </button>
+                    <div class="mobile-reader-actions">
+                      ${this.folder === 'trash'
+                        ? html`
+                            <button
+                              class="btn-action"
+                              style="padding: 5px 10px; font-size: 0.78rem;"
+                              @click=${() => this._moveThreadFolder(thread, 'inbox')}>
+                              ↩ Restore
+                            </button>
+                            <button
+                              class="btn-action btn-danger"
+                              style="padding: 5px 10px; font-size: 0.78rem;"
+                              @click=${() => this._confirmDeleteThreadPermanently(thread)}>
+                              ❌ Delete
+                            </button>
+                          `
+                        : html`
+                            <button
+                              class="btn-action"
+                              style="padding: 5px 10px; font-size: 0.78rem;"
+                              @click=${() => this._moveThreadFolder(thread, 'archive')}>
+                              📥 Archive
+                            </button>
+                            <button
+                              class="btn-action"
+                              style="padding: 5px 10px; font-size: 0.78rem;"
+                              @click=${() => this._moveThreadFolder(thread, 'trash')}>
+                              🗑 Trash
+                            </button>
+                          `}
+                      <button
+                        type="button"
+                        class="msg-star-btn"
+                        style="color:${thread.isStarred ? '#f59e0b' : '#9ca3af'}; font-size: 1.3rem; padding: 0 6px;"
+                        @click=${(e: Event) => this._toggleStar(thread, e)}>
+                        ${thread.isStarred ? '★' : '☆'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="thread-header">
                   <div class="thread-title-row">
                     <h2>${thread.cleanSubject}</h2>
                     <span class="spf-badge">✓ ${thread.latestMessage.spf_dmarc_status}</span>
@@ -1674,55 +2180,65 @@ export class ViewMailbox extends LitElement {
                 </div>
               `
             : html`<div class="empty-state">Select a conversation thread to read messages.</div>`}
+          </div>
         </div>
-      </div>
 
-      <!-- Lightbox / Preview Modal for Attachments -->
-      ${this.previewModalOpen && this.previewModalAttachment
-        ? html`
-            <div class="preview-modal-backdrop" @click=${this._closeAttachmentPreview}>
-              <div class="preview-modal-content" @click=${(e: Event) => e.stopPropagation()}>
-                <div class="preview-modal-header">
-                  <span>
-                    ${getAttachmentIcon(this.previewModalAttachment.filename, this.previewModalAttachment.content_type)}
-                    ${this.previewModalAttachment.filename} (${formatBytes(this.previewModalAttachment.size_bytes)})
-                  </span>
-                  <button
-                    type="button"
-                    class="btn-action"
-                    style="padding:4px 8px;font-size:1rem;"
-                    @click=${this._closeAttachmentPreview}>
-                    &times;
-                  </button>
-                </div>
-                <div class="preview-modal-body">
-                  ${(this.previewModalAttachment.content_type || '').startsWith('image/')
-                    ? html`<img
-                        src="data:${this.previewModalAttachment.content_type};base64,${this.previewModalAttachment.content_base64.replace(/\s+/g, '')}"
-                        style="max-width:100%;max-height:65vh;object-fit:contain;border-radius:8px;"
-                        alt="${this.previewModalAttachment.filename}"
-                      />`
-                    : this.previewModalAttachment.content_type === 'application/pdf' || this.previewModalAttachment.filename.endsWith('.pdf')
-                    ? html`<iframe
-                        src="data:application/pdf;base64,${this.previewModalAttachment.content_base64.replace(/\s+/g, '')}"
-                        style="width:100%;height:65vh;border:none;"
-                      ></iframe>`
-                    : html`<pre
-                        style="white-space:pre-wrap;word-break:break-word;width:100%;max-height:65vh;overflow:auto;font-family:monospace;font-size:0.88rem;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;"
-                      >${atob(this.previewModalAttachment.content_base64.replace(/\s+/g, ''))}</pre>`}
-                </div>
-                <div class="preview-modal-footer">
-                  <button
-                    class="btn-action"
-                    @click=${() => downloadAttachmentBlob(this.previewModalAttachment!)}>
-                    ⬇ Download
-                  </button>
-                  <button class="btn-action" @click=${this._closeAttachmentPreview}>Close</button>
+        <!-- Gmail Android Floating Compose Pill Button on Mobile -->
+        <button
+          type="button"
+          class="mobile-compose-fab"
+          @click=${() => this._openMobileCompose()}
+          aria-label="Compose new email">
+          <span style="font-size: 1.1rem;">✎</span> Compose
+        </button>
+
+        <!-- Lightbox / Preview Modal for Attachments -->
+        ${this.previewModalOpen && this.previewModalAttachment
+          ? html`
+              <div class="preview-modal-backdrop" @click=${this._closeAttachmentPreview}>
+                <div class="preview-modal-content" @click=${(e: Event) => e.stopPropagation()}>
+                  <div class="preview-modal-header">
+                    <span>
+                      ${getAttachmentIcon(this.previewModalAttachment.filename, this.previewModalAttachment.content_type)}
+                      ${this.previewModalAttachment.filename} (${formatBytes(this.previewModalAttachment.size_bytes)})
+                    </span>
+                    <button
+                      type="button"
+                      class="btn-action"
+                      style="padding:4px 8px;font-size:1rem;"
+                      @click=${this._closeAttachmentPreview}>
+                      &times;
+                    </button>
+                  </div>
+                  <div class="preview-modal-body">
+                    ${(this.previewModalAttachment.content_type || '').startsWith('image/')
+                      ? html`<img
+                          src="data:${this.previewModalAttachment.content_type};base64,${this.previewModalAttachment.content_base64.replace(/\s+/g, '')}"
+                          style="max-width:100%;max-height:65vh;object-fit:contain;border-radius:8px;"
+                          alt="${this.previewModalAttachment.filename}"
+                        />`
+                      : this.previewModalAttachment.content_type === 'application/pdf' || this.previewModalAttachment.filename.endsWith('.pdf')
+                      ? html`<iframe
+                          src="data:application/pdf;base64,${this.previewModalAttachment.content_base64.replace(/\s+/g, '')}"
+                          style="width:100%;height:65vh;border:none;"
+                        ></iframe>`
+                      : html`<pre
+                          style="white-space:pre-wrap;word-break:break-word;width:100%;max-height:65vh;overflow:auto;font-family:monospace;font-size:0.88rem;background:#1e1e2e;color:#cdd6f4;padding:16px;border-radius:8px;"
+                        >${atob(this.previewModalAttachment.content_base64.replace(/\s+/g, ''))}</pre>`}
+                  </div>
+                  <div class="preview-modal-footer">
+                    <button
+                      class="btn-action"
+                      @click=${() => downloadAttachmentBlob(this.previewModalAttachment!)}>
+                      ⬇ Download
+                    </button>
+                    <button class="btn-action" @click=${this._closeAttachmentPreview}>Close</button>
+                  </div>
                 </div>
               </div>
-            </div>
-          `
-        : ''}
+            `
+          : ''}
+      </div>
     `;
   }
 }

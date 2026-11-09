@@ -148,11 +148,28 @@ export class ComposeModal extends LitElement {
       width: 94vw;
       max-width: 660px;
       max-height: 92vh;
+      max-height: 92dvh;
       box-shadow: 0 24px 60px rgba(0, 0, 0, 0.32);
       background: #fff;
       color: #333;
       position: relative;
       overflow-y: auto;
+    }
+
+    @media (max-width: 640px) {
+      dialog {
+        width: 100vw;
+        width: 100dvw;
+        max-width: 100dvw;
+        height: 100vh;
+        height: 100dvh;
+        max-height: 100dvh;
+        margin: 0;
+        border-radius: 0;
+      }
+      .shortcut-tip {
+        display: none;
+      }
     }
 
     dialog:modal {

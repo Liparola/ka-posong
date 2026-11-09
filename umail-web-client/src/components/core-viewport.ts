@@ -23,6 +23,13 @@ export class CoreViewport extends LitElement {
       overflow-y: auto;
       padding: 16px;
       box-sizing: border-box;
+      overscroll-behavior: contain;
+    }
+
+    @media (max-width: 899px) {
+      :host {
+        padding: 0;
+      }
     }
   `;
 
