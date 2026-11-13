@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f3eb">
+  <meta name="description" content="A short animated introduction to ka-posong by Liparola: bespoke professional email for businesses in Lesotho.">
+  <title>ka-posong — Mail that feels like yours</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f6f3eb;
+      --ink: #173d35;
+      --muted: #62736b;
+      --green: #245c4b;
+      --lime: #c8dc9a;
+      --orange: #e99860;
+      --sky: #dce8df;
+      --white: #fffdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 32px 18px;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .page { width: min(100%, 980px); }
+    .eyebrow {
+      display: flex; align-items: center; gap: 9px;
+      margin: 0 0 14px 3px; color: var(--green);
+      font-size: 12px; font-weight: 750; letter-spacing: .14em; text-transform: uppercase;
+    }
+    .eyebrow::before { content: ""; width: 23px; height: 2px; background: var(--orange); }
+    .player {
+      position: relative; overflow: hidden; isolation: isolate;
+      aspect-ratio: 16 / 9; min-height: 350px;
+      border: 1px solid rgba(23,61,53,.12); border-radius: 22px;
+      background: var(--sky); box-shadow: 0 24px 70px rgba(30,61,47,.13);
+    }
+    .scene {
+      position: absolute; inset: 0; display: grid; grid-template-columns: 1fr 1fr;
+      align-items: center; gap: 3%; padding: 7% 8%; opacity: 0; visibility: hidden;
+      transition: opacity .65s ease, visibility .65s;
+    }
+    .scene.active { opacity: 1; visibility: visible; }
+    .scene-copy { position: relative; z-index: 2; max-width: 430px; }
+    .kicker { margin: 0 0 14px; color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+    h1, h2 { margin: 0; max-width: 11ch; font-family: Georgia, "Times New Roman", serif; font-size: clamp(32px, 5.2vw, 64px); font-weight: 500; letter-spacing: -.045em; line-height: .99; }
+    .scene-copy p:not(.kicker) { max-width: 36ch; margin: 18px 0 0; color: #466158; font-size: clamp(13px, 1.65vw, 17px); line-height: 1.55; }
+    .art { position: relative; width: 100%; aspect-ratio: 1; max-width: 390px; justify-self: center; }
+    .caption {
+      position: absolute; z-index: 5; left: 50%; bottom: 62px; width: max-content; max-width: 82%;
+      padding: 10px 16px; transform: translateX(-50%); border: 1px solid rgba(255,255,255,.6);
+      border-radius: 999px; background: rgba(255,253,248,.88); color: var(--ink);
+      font-size: clamp(11px, 1.4vw, 14px); font-weight: 600; text-align: center;
+      box-shadow: 0 5px 20px rgba(23,61,53,.08); backdrop-filter: blur(8px);
+    }
+    .controls {
+      position: absolute; z-index: 8; right: 18px; bottom: 15px; left: 18px;
+      display: flex; align-items: center; gap: 12px; color: var(--ink);
+    }
+    .control-button {
+      display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center;
+      border: 0; border-radius: 50%; background: var(--ink); color: white; cursor: pointer;
+    }
+    .control-button:focus-visible, .contact:focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
+    .control-button svg { width: 13px; height: 13px; fill: currentColor; }
+    .timeline { height: 4px; flex: 1; overflow: hidden; border-radius: 5px; background: rgba(23,61,53,.16); }
+    .progress { width: 0; height: 100%; border-radius: inherit; background: var(--green); }
+    .time { min-width: 38px; color: #4a6158; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .below { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 17px 4px 0; }
+    .below p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .contact {
+      display: inline-flex; flex: 0 0 auto; align-items: center; gap: 9px;
+      padding: 12px 17px; border-radius: 999px; background: var(--green); color: white;
+      font-size: 13px; font-weight: 700; text-decoration: none; transition: background .2s, transform .2s;
+    }
+    .contact:hover { transform: translateY(-2px); background: #173d35; }
+    .contact span { color: var(--lime); font-size: 18px; line-height: 10px; }
+    /* Simple, hand-drawn-feeling 2D scenes */
+    .sun { position: absolute; top: 11%; right: 13%; width: 19%; aspect-ratio: 1; border-radius: 50%; background: #f1bd76; }
+    .hill { position: absolute; bottom: 8%; width: 125%; height: 48%; border-radius: 50% 50% 0 0; }
+    .hill.back { left: -13%; background: #abc5ad; transform: rotate(-8deg); }
+    .hill.front { right: -24%; bottom: -5%; background: #71977c; transform: rotate(9deg); }
+    .envelope {
+      position: absolute; top: 31%; left: 28%; z-index: 2; width: 47%; height: 33%;
+      border-radius: 12px; background: #fffdf8; box-shadow: 0 17px 30px #244b3b2b;
+      animation: drift 4s ease-in-out infinite;
+    }
+    .envelope::before, .envelope::after { position: absolute; bottom: 0; width: 51%; height: 71%; content: ""; background: #efb27b; }
+    .envelope::before { left: 0; clip-path: polygon(0 100%, 100% 0, 100% 100%); }
+    .envelope::after { right: 0; clip-path: polygon(0 0, 100% 100%, 0 100%); background: #e79c68; }
+    .flap { position: absolute; top: 0; left: 0; z-index: 3; width: 100%; height: 65%; clip-path: polygon(0 0, 100% 0, 50% 100%); background: #f4c18c; }
+    .spark { position: absolute; color: var(--orange); font-size: 26px; animation: twinkle 2.2s ease-in-out infinite; }
+    .spark.one { top: 23%; left: 17%; } .spark.two { top: 58%; right: 13%; animation-delay: .8s; }
+    .shop { position: absolute; right: 7%; bottom: 15%; width: 72%; height: 51%; border: 3px solid var(--ink); border-radius: 9px 9px 4px 4px; background: #f7e5c7; }
+    .awning { position: absolute; top: -19%; left: -4%; width: 108%; height: 24%; border: 3px solid var(--ink); border-radius: 8px; background: repeating-linear-gradient(90deg, #e99860 0 18%, #fff1d9 18% 36%); }
+    .shop-window { position: absolute; top: 23%; left: 9%; width: 43%; height: 56%; border: 3px solid var(--ink); border-radius: 4px; background: #d5e6dc; }
+    .shop-door { position: absolute; right: 8%; bottom: 0; width: 24%; height: 64%; border: 3px solid var(--ink); border-bottom: 0; border-radius: 8px 8px 0 0; background: #d7a477; }
+    .sign { position: absolute; top: 8%; right: 7%; color: var(--ink); font-family: Georgia,serif; font-size: clamp(9px, 1.3vw, 14px); font-weight: bold; }
+    .person { position: absolute; bottom: 16%; left: 9%; width: 30%; height: 47%; }
+    .person .head { position: absolute; top: 0; left: 26%; width: 44%; aspect-ratio: 1; border: 2px solid var(--ink); border-radius: 50%; background: #ad6d4d; }
+    .person .body { position: absolute; bottom: 0; left: 10%; width: 78%; height: 61%; border: 2px solid var(--ink); border-radius: 24px 24px 8px 8px; background: #567d68; }
+    .laptop { position: absolute; right: 14%; bottom: 14%; width: 35%; height: 23%; border: 3px solid var(--ink); border-bottom-width: 6px; border-radius: 5px; background: #fffdf8; transform: rotate(-7deg); }
+    .cloud { position: absolute; top: 21%; left: 14%; width: 72%; height: 31%; border: 3px solid var(--ink); border-radius: 50px; background: #fffdf8; box-shadow: 0 12px 0 rgba(23,61,53,.1); }
+    .cloud::before, .cloud::after { position: absolute; bottom: 30%; z-index: -1; width: 42%; aspect-ratio: 1; border: 3px solid var(--ink); border-radius: 50%; background: #fffdf8; content: ""; }
+    .cloud::before { left: 12%; } .cloud::after { right: 12%; width: 52%; bottom: 22%; }
+    .cloud-face { position: absolute; top: 38%; left: 37%; font-size: 22px; letter-spacing: 8px; }
+    .tea { position: absolute; top: 35%; right: 4%; z-index: 2; width: 19%; height: 15%; border: 2px solid var(--ink); border-radius: 4px 4px 10px 10px; background: #e99860; }
+    .tea::after { position: absolute; right: -40%; top: 15%; width: 40%; height: 55%; border: 2px solid var(--ink); border-left: 0; border-radius: 0 10px 10px 0; content: ""; }
+    .tea-steam { position: absolute; top: 21%; right: 9%; color: #648274; font-size: 18px; animation: steam 2s ease-in-out infinite; }
+    .status { position: absolute; bottom: 17%; left: 15%; padding: 8px 12px; border: 1px solid #e6ddd0; border-radius: 9px; background: white; color: #8a6652; font-size: clamp(9px, 1.3vw, 13px); transform: rotate(-4deg); }
+    .mail-card {
+      position: absolute; top: 22%; left: 18%; width: 65%; padding: 9% 8%; border: 1px solid #dfe5dc;
+      border-radius: 15px; background: white; box-shadow: 0 20px 35px #244b3b20; transform: rotate(-3deg);
+    }
+    .mail-brand { margin: 0 0 15%; color: var(--green); font-family: Georgia,serif; font-size: clamp(13px, 2vw, 20px); font-weight: bold; }
+    .mail-line { height: 6px; margin: 9px 0; border-radius: 5px; background: #e4e9e1; }
+    .mail-line.short { width: 57%; background: #c8dc9a; }
+    .domain-tag { position: absolute; right: 1%; bottom: 20%; padding: 10px 14px; border-radius: 9px; background: var(--green); color: white; font-size: clamp(9px, 1.4vw, 13px); font-weight: 700; transform: rotate(5deg); }
+    .orbit { position: absolute; top: 9%; left: 9%; width: 80%; height: 80%; border: 1px dashed #88a58e; border-radius: 50%; animation: rotate 24s linear infinite; }
+    .orbit::before { position: absolute; top: 10%; right: 8%; width: 12px; height: 12px; border-radius: 50%; background: var(--orange); content: ""; }
+    .final-mark { position: absolute; top: 25%; left: 22%; width: 56%; aspect-ratio: 1; display: grid; place-items: center; border-radius: 50%; background: #e6edda; }
+    .final-mark .envelope { position: relative; inset: auto; width: 58%; height: 39%; animation: none; }
+    @keyframes drift { 0%,100% { transform: translateY(0) rotate(-3deg); } 50% { transform: translateY(-12px) rotate(2deg); } }
+    @keyframes twinkle { 0%,100% { opacity: .4; transform: scale(.8); } 50% { opacity: 1; transform: scale(1.15); } }
+    @keyframes steam { 0%,100% { opacity: .3; transform: translateY(5px); } 50% { opacity: .9; transform: translateY(-5px); } }
+    @keyframes rotate { to { transform: rotate(360deg); } }
+    @media (max-width: 650px) {
+      body { padding: 20px 12px; }
+      .player { min-height: 500px; aspect-ratio: 4 / 5; border-radius: 17px; }
+      .scene { grid-template-columns: 1fr; grid-template-rows: auto 1fr; gap: 0; align-content: center; padding: 11% 9% 16%; }
+      .scene-copy { align-self: end; }
+      h1,h2 { font-size: clamp(35px, 10vw, 52px); }
+      .scene-copy p:not(.kicker) { margin-top: 11px; font-size: 14px; }
+      .art { width: min(72%, 270px); align-self: start; margin-top: 0; }
+      .caption { bottom: 59px; }
+      .below { align-items: flex-start; flex-direction: column; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <p class="eyebrow">A little note from Liparola</p>
+    <section class="player" aria-label="Animated ka-posong promotional video" aria-roledescription="video">
+      <article class="scene active" data-duration="6" aria-hidden="false">
+        <div class="scene-copy"><p class="kicker">For the people building here</p><h1>Your work has a name. Your email should too.</h1><p>Meet ka-posong: professional email, made personal for Lesotho's businesses and professionals.</p></div>
+        <div class="art" aria-hidden="true"><div class="sun"></div><div class="hill back"></div><div class="hill front"></div><div class="envelope"><div class="flap"></div></div><b class="spark one">✳</b><b class="spark two">✦</b></div>
+      </article>
+      <article class="scene" data-duration="6" aria-hidden="true">
+        <div class="scene-copy"><p class="kicker">Small start. Big plans.</p><h2>From first client to next chapter.</h2><p>A custom business address helps every hello, quote and follow-up feel like you mean business.</p></div>
+        <div class="art" aria-hidden="true"><div class="sun"></div><div class="shop"><div class="awning"></div><span class="sign">YOUR BUSINESS</span><div class="shop-window"></div><div class="shop-door"></div></div><div class="person"><div class="head"></div><div class="body"></div></div><div class="laptop"></div><b class="spark one">✦</b></div>
+      </article>
+      <article class="scene" data-duration="6" aria-hidden="true">
+        <div class="scene-copy"><p class="kicker">A little perspective</p><h2>Even big clouds can need a tea break.</h2><p>When a global inbox has a wobbly day, your business still deserves an email plan that feels close to home.</p></div>
+        <div class="art" aria-hidden="true"><div class="sun" style="background:#e8d9c2"></div><div class="cloud"><span class="cloud-face">•‿•</span></div><div class="tea"><span class="tea-steam">〰</span></div><div class="status">“Back in a moment…”</div><b class="spark two">✳</b></div>
+      </article>
+      <article class="scene" data-duration="6" aria-hidden="true">
+        <div class="scene-copy"><p class="kicker">Meet ka-posong by Liparola</p><h2>Professional email, with your name on it.</h2><p>Bespoke email for your domain, thoughtfully set up for your team and the way your business works.</p></div>
+        <div class="art" aria-hidden="true"><div class="orbit"></div><div class="mail-card"><p class="mail-brand">Good day, Naledi.</p><div class="mail-line"></div><div class="mail-line"></div><div class="mail-line short"></div></div><div class="domain-tag">hello@yourbusiness.co.ls</div></div>
+      </article>
+      <article class="scene" data-duration="6" aria-hidden="true">
+        <div class="scene-copy"><p class="kicker">Make your next hello count</p><h2>Let’s give your business a proper address.</h2><p>Talk to Liparola about bespoke professional email with ka-posong.</p></div>
+        <div class="art" aria-hidden="true"><div class="orbit"></div><div class="final-mark"><div class="envelope"><div class="flap"></div></div></div><b class="spark one">✦</b><b class="spark two">✳</b></div>
+      </article>
+      <div class="caption" aria-live="polite">Your work has a name. Your email should too.</div>
+      <div class="controls">
+        <button class="control-button" type="button" aria-label="Pause animation"><svg class="pause-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 2h3v12H3zm7 0h3v12h-3z"/></svg><svg class="play-icon" viewBox="0 0 16 16" aria-hidden="true" hidden><path d="M4 2.5 14 8l-10 5.5z"/></svg></button>
+        <div class="timeline" role="progressbar" aria-label="Video progress" aria-valuemin="0" aria-valuemax="30" aria-valuenow="0"><div class="progress"></div></div>
+        <span class="time" aria-label="Time remaining">0:30</span>
+      </div>
+    </section>
+    <div class="below"><p>30 seconds • Animated story • Captions on screen<br>For bespoke email service, contact Liparola.</p><a class="contact" href="https://liparola.org" target="_blank" rel="noopener noreferrer">Talk to Liparola <span aria-hidden="true">↗</span></a></div>
+  </main>
+  <script>
+    (() => {
+      const scenes = [...document.querySelectorAll('.scene')];
+      const caption = document.querySelector('.caption');
+      const button = document.querySelector('.control-button');
+      const pauseIcon = document.querySelector('.pause-icon');
+      const playIcon = document.querySelector('.play-icon');
+      const progress = document.querySelector('.progress');
+      const timeline = document.querySelector('.timeline');
+      const time = document.querySelector('.time');
+      const total = scenes.reduce((sum, scene) => sum + Number(scene.dataset.duration), 0);
+      const captions = scenes.map(scene => scene.querySelector('h1,h2').textContent.trim());
+      let elapsed = 0;
+      let last = performance.now();
+      let paused = false;
+      let frame;
+
+      function draw(now) {
+        if (!paused) elapsed = Math.min(total, elapsed + (now - last) / 1000);
+        last = now;
+        let edge = 0;
+        let active = scenes.length - 1;
+        for (let i = 0; i < scenes.length; i++) {
+          const end = edge + Number(scenes[i].dataset.duration);
+          const isActive = elapsed < end || i === scenes.length - 1;
+          scenes[i].classList.toggle('active', isActive);
+          scenes[i].setAttribute('aria-hidden', String(!isActive));
+          if (isActive) { active = i; break; }
+          edge = end;
+        }
+        caption.textContent = captions[active];
+        progress.style.width = `${(elapsed / total) * 100}%`;
+        timeline.setAttribute('aria-valuenow', String(Math.floor(elapsed)));
+        const remaining = Math.ceil(total - elapsed);
+        time.textContent = `0:${String(remaining).padStart(2, '0')}`;
+        if (elapsed >= total && !paused) {
+          paused = true;
+          button.setAttribute('aria-label', 'Replay animation');
+          pauseIcon.hidden = true;
+          playIcon.hidden = false;
+        }
+        frame = requestAnimationFrame(draw);
+      }
+      button.addEventListener('click', () => {
+        if (elapsed >= total) elapsed = 0;
+        paused = !paused;
+        last = performance.now();
+        button.setAttribute('aria-label', paused ? 'Play animation' : 'Pause animation');
+        pauseIcon.hidden = paused;
+        playIcon.hidden = !paused;
+      });
+      frame = requestAnimationFrame(draw);
+      window.addEventListener('pagehide', () => cancelAnimationFrame(frame), { once: true });
+    })();
+  </script>
+</body>
+</html>
