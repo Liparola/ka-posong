@@ -7,6 +7,16 @@ compatibility_date = "2026-01-01"
 
 [vars]
 TUNNEL_INGEST_URL = "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email"
+BRIDGE_SECRET = "replace-via-wrangler-secret-put"
 
-# Set BRIDGE_SECRET securely using:
-# npx wrangler secret put BRIDGE_SECRET
+[env.development.vars]
+TUNNEL_INGEST_URL = "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email"
+BRIDGE_SECRET = "replace-via-wrangler-secret-put"
+
+[env.production.vars]
+TUNNEL_INGEST_URL = "https://lipserver-optiplex-3040.tail8fafd0.ts.net/ingest-email"
+BRIDGE_SECRET = "replace-via-wrangler-secret-put"
+
+# Set BRIDGE_SECRET securely per environment using:
+# npx wrangler secret put BRIDGE_SECRET --env development
+# npx wrangler secret put BRIDGE_SECRET --env production

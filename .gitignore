@@ -3,6 +3,7 @@ target/
 **/target/
 **/dist/
 **/node_modules/
+**/node_modules
 
 # Databases & Runtime Secrets
 *.db
@@ -14,3 +15,10 @@ target/
 # Logs & Temp
 *.log
 logs/
+
+# Domain Zone Exports, Promo Assets & Scratch Notes
+domains/*.txt
+promo/
+*.pdf
+Analyzed email ingress.txt.md
+Canceled run live DNS.txt.md

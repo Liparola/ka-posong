@@ -6,12 +6,16 @@
 
 ## 1. Quick Access Directory & Service Endpoints
 
-| Portal / Interface | Primary URL | Secondary / Local URL | Purpose |
+> **Two-Host Topology Note:**
+> - **Development Host (`aurum-thinkpad-t440p`):** `100.83.242.97` / `https://aurum-thinkpad-t440p.tail8fafd0.ts.net`
+> - **Production Host (`lipserver-optiplex-3040`):** `100.109.250.50` / `https://lipserver-optiplex-3040.tail8fafd0.ts.net`
+
+| Portal / Interface | Production / Development URL | Local Loopback URL | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Super Manager Dashboard** | `https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ops` | `http://127.0.0.1:3000/ops` | Multi-tenant organization control, domain onboarding, DNS exports, mailbox creation & deletion |
-| **uMail Web Client (PWA)** | `https://liparola.org/umail` | `https://liparola-ls.web.app/umail` | Flagship webmail client with thread conversation view, 120MB attachments, and Trash purge |
-| **UMANG OTP Bridge** | `http://127.0.0.1:3001` | `http://192.168.9.1` (Huawei SMS Router) | WhatsApp & SMS OTP dispatch engine for passwordless login |
-| **Rust Control Plane Gateway** | `https://aurum-thinkpad-t440p.tail8fafd0.ts.net:8443` | `http://127.0.0.1:3000` | Ingress MIME webhook receiver, JMAP REST API, and SMTPS Port 465 relay |
+| **Super Manager Dashboard** | `https://lipserver-optiplex-3040.tail8fafd0.ts.net/ops` (Prod) / `https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ops` (Dev) | `http://127.0.0.1:8443/ops` | Multi-tenant organization control, domain onboarding, DNS exports, mailbox creation & deletion |
+| **uMail Web Client (PWA)** | `https://liparola.org/umail` | `http://127.0.0.1:8443/umail` (or `:5176` Vite dev) | Flagship webmail client with thread conversation view, 120MB attachments, and Trash purge |
+| **UMANG Core Identity** | `http://127.0.0.1:3000` | `http://127.0.0.1:3000/api/health` | Shared UMANG OIDC/PKCE & WhatsApp/SMS OTP dispatch engine |
+| **Rust Control Plane Gateway** | `https://lipserver-optiplex-3040.tail8fafd0.ts.net` (Prod) / `https://aurum-thinkpad-t440p.tail8fafd0.ts.net` (Dev) | `http://127.0.0.1:8443` | Ingress MIME webhook receiver, JMAP REST API, and SMTPS Port 465 relay |
 
 ---
 
@@ -21,9 +25,10 @@ The **Super Manager Dashboard** is the single pane of glass for managing tenants
 
 ### How to Access the Dashboard in Your Browser
 1. Open your browser and navigate to:
-   - **Local / Office Network**: [http://127.0.0.1:3000/ops](http://127.0.0.1:3000/ops) or `http://localhost:3000/ops`
-   - **Remote / Mobile (via Tailscale Funnel)**: [https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ops](https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ops)
-2. The dashboard connects directly to the Control Plane database (`control_plane.db`) and pre-fills your secure **DevOps Master Key** (`devops-master-key`) for authenticated administrative actions.
+   - **Local Loopback**: [http://127.0.0.1:8443/ops](http://127.0.0.1:8443/ops)
+   - **Production (via Tailscale)**: `https://lipserver-optiplex-3040.tail8fafd0.ts.net/ops`
+   - **Development (via Tailscale)**: `https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ops`
+2. Authenticate using your host-configured **DevOps Master Key** (`<MASTER_DEVOPS_KEY>`) to establish an `HttpOnly` operator session cookie for administrative actions.
 
 ---
 
@@ -132,9 +137,11 @@ Use this section to articulate the business value when presenting to prospective
 | **Cloudflare Edge Protection** | 100% spam, spoofing, and phishing protection at Cloudflare's global edge network before messages ever touch the client's inbox. | Enterprise-grade perimeter defense included standard across all tiers. |
 | **1-Click Tenant Onboarding** | Customers can keep their existing domain registrar (e.g. `.co.ls` with Leo / Telecom Lesotho) and simply paste our generated DNS records. | Frictionless migration with zero downtime. |
 
-### Suggested Commercial Pricing Tiers
+### Suggested Commercial Pricing Tiers (Proposal — Subject to Business & Finance Sign-Off)
 
-1. **Starter Tier (M199 / month)**
+> **Governance Note:** The tiers and prices below are illustrative commercial proposals. Refer to the approved Liparola service catalog and signed customer contracts as the binding authority before quoting or invoicing.
+
+1. **Starter Tier (Proposed: M199 / month)**
    - 1 Domain (`company.co.ls`)
    - Up to 5 Mailboxes
    - 10 GB Cloud Storage

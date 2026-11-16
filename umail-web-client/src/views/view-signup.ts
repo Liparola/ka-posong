@@ -135,8 +135,7 @@ export class ViewSignup extends LitElement {
         PENDING_OTP_HINT_KEY,
         JSON.stringify({
           email: resp.email_hint,
-          channel: resp.channel,
-          otpPreview: resp.dev_otp_preview
+          channel: resp.channel
         })
       );
       router.navigate('app://otp');
@@ -163,7 +162,7 @@ export class ViewSignup extends LitElement {
             <input
               id="name"
               type="text"
-              placeholder="Khahliso Ramotoai"
+              placeholder="Your full name"
               .value=${this.name}
               @input=${(e: Event) => (this.name = (e.target as HTMLInputElement).value)}
             />
@@ -177,7 +176,7 @@ export class ViewSignup extends LitElement {
                 id="phone"
                 type="tel"
                 inputmode="numeric"
-                placeholder="57284264"
+                placeholder="5xxxxxxx"
                 .value=${this.phone}
                 @input=${(e: Event) => {
                   const t = e.target as HTMLInputElement;

@@ -973,6 +973,10 @@ pub async fn dispatch_outbound_email(
             curl_cmd
                 .arg("-sS")
                 .arg("--ssl-reqd")
+                .arg("--connect-timeout")
+                .arg("10")
+                .arg("--max-time")
+                .arg("25")
                 .arg("--url")
                 .arg("smtps://smtp.mx.cloudflare.net:465")
                 .arg("--user")

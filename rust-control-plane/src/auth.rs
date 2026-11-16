@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Row, SqlitePool};
 use std::sync::Arc;
 
 use crate::AppState;
@@ -44,19 +44,139 @@ pub struct AuthContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UmangJwtClaims {
     pub sub: String,
+    #[serde(default)]
+    pub jti: String,
     pub phone: String,
+    #[serde(default)]
     pub email: String,
+    #[serde(default)]
     pub name: String,
-    #[serde(rename = "clientId")]
+    #[serde(rename = "clientId", default)]
     pub client_id: String,
+    #[serde(rename = "tenantId", default)]
+    pub tenant_id: String,
+    #[serde(default)]
     pub domain: String,
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub access: String,
+    #[serde(default)]
     pub subscription: String,
-    #[serde(rename = "planId")]
+    #[serde(rename = "planId", default)]
     pub plan_id: String,
     pub exp: usize,
     pub iat: usize,
+}
+
+pub const OPS_SESSION_COOKIE: &str = "kaposong_ops_session";
+
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+pub fn create_ops_session_token(jwt_secret: &str) -> String {
+    let exp = chrono::Utc::now().timestamp() + (8 * 3600);
+    let payload = format!("ops_master:{}", exp);
+    let sig = compute_hmac_hex(jwt_secret, payload.as_bytes());
+    format!("{}.{}", exp, sig)
+}
+
+pub fn verify_ops_session_cookie(headers: &HeaderMap, jwt_secret: &str) -> bool {
+    let cookie_header = match headers.get("Cookie").and_then(|v| v.to_str().ok()) {
+        Some(c) => c,
+        None => return false,
+    };
+    for part in cookie_header.split(';') {
+        let trimmed = part.trim();
+        if let Some(val) = trimmed.strip_prefix(&format!("{}=", OPS_SESSION_COOKIE)) {
+            if let Some((exp_str, sig)) = val.split_once('.') {
+                if let Ok(exp) = exp_str.parse::<i64>() {
+                    if exp > chrono::Utc::now().timestamp() {
+                        let expected_payload = format!("ops_master:{}", exp);
+                        let expected_sig = compute_hmac_hex(jwt_secret, expected_payload.as_bytes());
+                        if constant_time_eq(sig, &expected_sig) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+pub async fn revoke_token(pool: &SqlitePool, token: &str, jwt_secret: &str) {
+    let token_hash = hash_api_key(token);
+    let exp_default = chrono::Utc::now().timestamp() + (8 * 3600);
+    let mut expires_at = exp_default;
+    let mut jti = String::new();
+
+    if let Some(claims) = verify_umang_jwt(token, jwt_secret) {
+        expires_at = claims.exp as i64;
+        jti = claims.jti;
+    }
+
+    let _ = sqlx::query(
+        "INSERT OR IGNORE INTO revoked_tokens (token_key, expires_at) VALUES (?, ?)",
+    )
+    .bind(&token_hash)
+    .bind(expires_at)
+    .execute(pool)
+    .await;
+
+    if !jti.is_empty() {
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO revoked_tokens (token_key, expires_at) VALUES (?, ?)",
+        )
+        .bind(&jti)
+        .bind(expires_at)
+        .execute(pool)
+        .await;
+    }
+}
+
+pub async fn revoke_jti(pool: &SqlitePool, jti: &str, expires_at: i64) {
+    if jti.trim().is_empty() {
+        return;
+    }
+    let _ = sqlx::query(
+        "INSERT OR IGNORE INTO revoked_tokens (token_key, expires_at) VALUES (?, ?)",
+    )
+    .bind(jti.trim())
+    .bind(expires_at)
+    .execute(pool)
+    .await;
+}
+
+pub async fn is_token_revoked(pool: &SqlitePool, token: &str, jti: &str) -> bool {
+    let token_hash = hash_api_key(token);
+    let row = if !jti.trim().is_empty() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM revoked_tokens WHERE token_key = ? OR token_key = ?",
+        )
+        .bind(&token_hash)
+        .bind(jti.trim())
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM revoked_tokens WHERE token_key = ?",
+        )
+        .bind(&token_hash)
+        .fetch_one(pool)
+        .await
+    };
+    row.unwrap_or(0) > 0
 }
 
 pub fn hash_api_key(raw: &str) -> String {
@@ -94,7 +214,7 @@ pub fn verify_umang_jwt(token: &str, secret: &str) -> Option<UmangJwtClaims> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(signing_input.as_bytes());
     let expected_sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    if expected_sig != parts[2] {
+    if !constant_time_eq(&expected_sig, parts[2]) {
         return None;
     }
     let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
@@ -110,29 +230,61 @@ pub async fn resolve_auth_context(
     state: &Arc<AppState>,
     headers: &HeaderMap,
 ) -> Result<AuthContext, (StatusCode, String)> {
-    // 1. Check Bearer JWT token first (for uMail User or Scoped JWT)
+    // 1. Check Bearer JWT token or DevOps key in Authorization header
     if let Some(bearer) = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
     {
-        if bearer == state.master_devops_key {
+        if constant_time_eq(bearer, &state.master_devops_key) {
             return Ok(AuthContext {
                 role: Role::DevOpsMaster,
             });
         }
         if let Some(claims) = verify_umang_jwt(bearer, &state.jwt_secret) {
+            if is_token_revoked(&state.db, bearer, &claims.jti).await {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Session token has been revoked".to_string(),
+                ));
+            }
+            let mut resolved_tid = claims.client_id.clone();
+            let mut resolved_email = claims.email.clone();
+            if resolved_tid == state.umang_tenant_id
+                || resolved_tid == state.umang_client_id
+                || resolved_tid.is_empty()
+                || resolved_email.is_empty()
+            {
+                if let Ok(Some(row)) = sqlx::query(
+                    "SELECT email, tenant_id FROM mailboxes WHERE (email = ? OR phone = ?) AND status = 'ACTIVE' ORDER BY created_at ASC LIMIT 1",
+                )
+                .bind(&claims.email)
+                .bind(&claims.phone)
+                .fetch_optional(&state.db)
+                .await
+                {
+                    resolved_email = row.get("email");
+                    resolved_tid = row.get("tenant_id");
+                }
+            }
             return Ok(AuthContext {
                 role: Role::UmailUser {
-                    email: claims.email,
+                    email: resolved_email,
                     phone: claims.phone,
-                    tenant_id: claims.client_id,
+                    tenant_id: resolved_tid,
                 },
             });
         }
     }
 
-    // 2. Check X-API-Key header
+    // 2. Check HttpOnly Signed Ops Session Cookie (for authenticated /ops dashboard calls)
+    if verify_ops_session_cookie(headers, &state.jwt_secret) {
+        return Ok(AuthContext {
+            role: Role::DevOpsMaster,
+        });
+    }
+
+    // 3. Check X-API-Key header
     let api_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
@@ -143,7 +295,7 @@ pub async fn resolve_auth_context(
             )
         })?;
 
-    if api_key == state.master_devops_key {
+    if constant_time_eq(api_key, &state.master_devops_key) {
         return Ok(AuthContext {
             role: Role::DevOpsMaster,
         });

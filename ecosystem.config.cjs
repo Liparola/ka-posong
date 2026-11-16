@@ -1,33 +1,38 @@
+'use strict';
+
+const fs = require('fs');
 const path = require('path');
 
+function loadDotEnv(filePath) {
+  const envVars = {};
+  if (!fs.existsSync(filePath)) return envVars;
+  const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eqIdx = line.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = line.slice(0, eqIdx).trim();
+    let val = line.slice(eqIdx + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    envVars[key] = val;
+  }
+  return envVars;
+}
+
 const ROOT_DIR = __dirname;
+const dotEnv = loadDotEnv(path.join(ROOT_DIR, '.env'));
 
 module.exports = {
   apps: [
     {
-      name: 'kaposong-umang-otp-bridge',
-      script: path.join(ROOT_DIR, 'umang-otp-bridge/src/server.js'),
-      cwd: path.join(ROOT_DIR, 'umang-otp-bridge'),
-      instances: 1,
-      exec_mode: 'fork',
-      autorestart: true,
-      watch: false,
-      env: {
-        NODE_ENV: 'production',
-        UMANG_BRIDGE_PORT: '3001',
-        ROUTER_IPS: '192.168.9.1,192.168.8.1,192.168.10.1',
-        ROUTER_USER: 'admin',
-        ROUTER_PASS: 'Technomath',
-        WWEBJS_AUTH_PATH:
-          '/home/aurum/Documents/Projects/Business/Liparola FC/ka.sesiung/workspace-otp-server/.wwebjs_auth',
-      },
-      out_file: path.join(ROOT_DIR, 'logs/umang-otp-bridge.log'),
-      error_file: path.join(ROOT_DIR, 'logs/umang-otp-bridge.log'),
-      merge_logs: true,
-    },
-    {
       name: 'kaposong-rust-control-plane',
-      script: path.join(ROOT_DIR, 'rust-control-plane/target/debug/rust-control-plane'),
+      script: path.join(ROOT_DIR, 'rust-control-plane/target/release/rust-control-plane'),
       cwd: path.join(ROOT_DIR, 'rust-control-plane'),
       interpreter: 'none',
       instances: 1,
@@ -35,27 +40,30 @@ module.exports = {
       autorestart: true,
       watch: false,
       env: {
-        PORT: '8443',
-        SECONDARY_PORT: '3000',
-        DATABASE_URL: `sqlite://${path.join(ROOT_DIR, 'rust-control-plane/control_plane.db')}?mode=rwc`,
-        UMANG_OTP_BRIDGE_URL: 'http://127.0.0.1:3001',
-        PRIMARY_MAIL_HOSTNAME: 'aurum-thinkpad-t440p.tail8fafd0.ts.net',
-        MASTER_DEVOPS_KEY: 'devops-master-key',
-        BRIDGE_SECRET: 'cf-tunnel-secret',
-        ALLOW_DEV_OTP_PREVIEW: 'true',
-        // Outbound HTTPS Email Relay (Port 443 — bypasses ISP/VPN Port 25/587 blocks):
-        // 1. Cloudflare Email Sending Service (Beta) Direct REST API & SMTPS (Port 465):
-        CLOUDFLARE_API_TOKEN:
-          process.env.CLOUDFLARE_API_TOKEN ||
-          'replace-with-cloudflare-api-token',
-        CLOUDFLARE_ACCOUNT_ID:
-          process.env.CLOUDFLARE_ACCOUNT_ID ||
-          '5d34290efd0db9537a45b9bb167f6e7f',
-        // 2. Cloudflare Worker Edge Relay URL:
-        OUTBOUND_WORKER_URL: process.env.OUTBOUND_WORKER_URL || '',
-        // 3. Fallbacks (Resend / Brevo):
-        RESEND_API_KEY: process.env.RESEND_API_KEY || '',
-        BREVO_API_KEY: process.env.BREVO_API_KEY || '',
+        RUST_LOG: process.env.RUST_LOG || dotEnv.RUST_LOG || 'info,rust_control_plane=info',
+        APP_ENV: process.env.APP_ENV || dotEnv.APP_ENV || 'production',
+        HOST: process.env.HOST || dotEnv.HOST || '127.0.0.1',
+        PORT: process.env.PORT || dotEnv.PORT || '8443',
+        SECONDARY_PORT: process.env.SECONDARY_PORT || dotEnv.SECONDARY_PORT || '0',
+        ALLOW_DEV_OTP_PREVIEW: process.env.ALLOW_DEV_OTP_PREVIEW || dotEnv.ALLOW_DEV_OTP_PREVIEW || 'false',
+        ALLOW_LOCAL_OTP_FALLBACK: process.env.ALLOW_LOCAL_OTP_FALLBACK || dotEnv.ALLOW_LOCAL_OTP_FALLBACK || 'false',
+        ALLOW_DETERMINISTIC_DKIM_FALLBACK:
+          process.env.ALLOW_DETERMINISTIC_DKIM_FALLBACK || dotEnv.ALLOW_DETERMINISTIC_DKIM_FALLBACK || 'false',
+        DATABASE_URL:
+          process.env.DATABASE_URL ||
+          dotEnv.DATABASE_URL ||
+          `sqlite://${path.join(ROOT_DIR, 'rust-control-plane/control_plane.db')}?mode=rwc`,
+        UMANG_CORE_URL: process.env.UMANG_CORE_URL || dotEnv.UMANG_CORE_URL || 'http://127.0.0.1:3000',
+        UMANG_TENANT_ID: process.env.UMANG_TENANT_ID || dotEnv.UMANG_TENANT_ID || 'tnt_ka_posong',
+        UMANG_CLIENT_ID: process.env.UMANG_CLIENT_ID || dotEnv.UMANG_CLIENT_ID || 'umang_pk_ka_posong',
+        UMANG_API_KEY: process.env.UMANG_API_KEY || dotEnv.UMANG_API_KEY || '',
+        UMANG_WEBHOOK_SECRET: process.env.UMANG_WEBHOOK_SECRET || dotEnv.UMANG_WEBHOOK_SECRET || '',
+        PRIMARY_MAIL_HOSTNAME: process.env.PRIMARY_MAIL_HOSTNAME || dotEnv.PRIMARY_MAIL_HOSTNAME || '',
+        UMAIL_STATIC_DIR:
+          process.env.UMAIL_STATIC_DIR ||
+          dotEnv.UMAIL_STATIC_DIR ||
+          path.join(ROOT_DIR, 'umail-web-client/dist'),
+        ...dotEnv,
       },
       out_file: path.join(ROOT_DIR, 'logs/rust-control-plane.log'),
       error_file: path.join(ROOT_DIR, 'logs/rust-control-plane.log'),

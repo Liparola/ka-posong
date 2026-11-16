@@ -11,7 +11,7 @@
  *    bilingual Sesotho/English message formatting.
  * 2. Hardware SMS Delivery via `HuaweiGateway` (`workspace-otp-server-sms` driver)
  *    and Huawei LTE Router Pool (`192.168.9.1`, `192.168.8.1`, `192.168.10.1`)
- *    with SCRAM/SHA256 authentication (`admin` / `Technomath`) and Lesotho 8-digit
+ *    with SCRAM/SHA256 authentication (`ROUTER_USER` / `ROUTER_PASS`) and Lesotho 8-digit
  *    normalization.
  * 3. Origin-bound WebOTP SMS formatting (`@<domain> #<otp>`) on the final line
  *    so mobile browsers and Safari autofill bars verify the tenant domain.
@@ -149,7 +149,7 @@ async function initHuaweiGatewayPool() {
       .map((s) => s.trim())
       .filter(Boolean);
     const user = process.env.ROUTER_USER || 'admin';
-    const pass = process.env.ROUTER_PASS || 'Technomath';
+    const pass = process.env.ROUTER_PASS || '';
 
     huaweiGateway = new HuaweiGateway({
       routers: routerIps.map((ip) => ({

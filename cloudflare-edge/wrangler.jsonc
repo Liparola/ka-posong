@@ -11,6 +11,20 @@
   ],
   "vars": {
     "TAILSCALE_INGRESS_URL": "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email",
-    "BRIDGE_SECRET": "cf-tunnel-secret"
+    "BRIDGE_SECRET": "replace-via-wrangler-secret-put"
+  },
+  "env": {
+    "development": {
+      "vars": {
+        "TAILSCALE_INGRESS_URL": "https://aurum-thinkpad-t440p.tail8fafd0.ts.net/ingest-email",
+        "BRIDGE_SECRET": "replace-via-wrangler-secret-put"
+      }
+    },
+    "production": {
+      "vars": {
+        "TAILSCALE_INGRESS_URL": "https://lipserver-optiplex-3040.tail8fafd0.ts.net/ingest-email",
+        "BRIDGE_SECRET": "replace-via-wrangler-secret-put"
+      }
+    }
   }
 }

@@ -10,10 +10,35 @@ import {
 
 @customElement('view-login')
 export class ViewLogin extends LitElement {
-  @state() private phone = '57284264';
+  @state() private phone = '';
   @state() private channel: 'whatsapp' | 'sms' = 'whatsapp';
   @state() private error = '';
   @state() private loading = false;
+  @state() private ssoLoading = false;
+
+  override connectedCallback() {
+    super.connectedCallback();
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const stateParam = params.get('state');
+    if (code) {
+      this.ssoLoading = true;
+      void this.handleSsoCallback(code, stateParam);
+    }
+  }
+
+  private async handleSsoCallback(code: string, stateParam: string | null) {
+    try {
+      await authService.exchangeSsoCode(code, stateParam);
+      window.history.replaceState({}, '', '/umail/inbox');
+      router.navigate('app://inbox');
+    } catch (err: unknown) {
+      window.history.replaceState({}, '', '/umail/login');
+      this.error = err instanceof Error ? err.message : 'UMANG SSO authentication failed.';
+    } finally {
+      this.ssoLoading = false;
+    }
+  }
 
   static styles = css`
     :host {
@@ -122,40 +147,6 @@ export class ViewLogin extends LitElement {
       background: #f5f0ff;
       color: #6200ee;
     }
-    .quick-accounts {
-      text-align: left;
-      background: #f9f9fc;
-      border: 1px dashed #d5d0e8;
-      border-radius: 8px;
-      padding: 10px 12px;
-      margin-bottom: 18px;
-      font-size: 0.78rem;
-      color: #555;
-    }
-    .quick-accounts strong {
-      display: block;
-      color: #333;
-      margin-bottom: 6px;
-    }
-    .pill-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-    .acct-pill {
-      background: #fff;
-      border: 1px solid #d0c4f7;
-      color: #6200ee;
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-size: 0.75rem;
-      cursor: pointer;
-      font-weight: 600;
-    }
-    .acct-pill:hover {
-      background: #6200ee;
-      color: #fff;
-    }
     .error {
       color: #d32f2f;
       font-size: 0.85rem;
@@ -180,6 +171,58 @@ export class ViewLogin extends LitElement {
     button.submit-btn:disabled {
       background: #ccc;
       cursor: not-allowed;
+    }
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 18px 0 14px 0;
+      color: #888;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .divider::before,
+    .divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: #e2e2e9;
+    }
+    button.sso-btn {
+      width: 100%;
+      padding: 12px 14px;
+      background: #0f172a;
+      color: #ffffff;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: background 0.2s;
+    }
+    button.sso-btn:hover {
+      background: #1e293b;
+    }
+    button.sso-btn:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+    .sso-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      border-radius: 5px;
+      background: #10b981;
+      color: #052e16;
+      font-weight: 900;
+      font-size: 0.78rem;
     }
     .footer {
       margin-top: 22px;
@@ -209,11 +252,6 @@ export class ViewLogin extends LitElement {
     this.error = '';
   }
 
-  private selectQuickPhone(digits: string) {
-    this.phone = digits;
-    this.error = '';
-  }
-
   private async handleSubmit(e: Event) {
     e.preventDefault();
     if (this.phone.length !== 8) {
@@ -229,13 +267,12 @@ export class ViewLogin extends LitElement {
     try {
       const resp = await authService.requestOtp(phoneNumber, this.channel);
       sessionStorage.setItem(PENDING_PHONE_KEY, phoneNumber);
-      if (resp.dev_otp_preview || resp.email_hint) {
+      if (resp.email_hint || resp.channel) {
         sessionStorage.setItem(
           PENDING_OTP_HINT_KEY,
           JSON.stringify({
             email: resp.email_hint,
-            channel: resp.channel,
-            otpPreview: resp.dev_otp_preview
+            channel: resp.channel
           })
         );
       }
@@ -248,6 +285,17 @@ export class ViewLogin extends LitElement {
     }
   }
 
+  private async handleUmangSso() {
+    this.ssoLoading = true;
+    this.error = '';
+    try {
+      await authService.startUmangSsoLogin();
+    } catch (err: unknown) {
+      this.error = err instanceof Error ? err.message : 'Unable to launch UMANG SSO.';
+      this.ssoLoading = false;
+    }
+  }
+
   private navToSignup(e: Event) {
     e.preventDefault();
     router.navigate('app://signup');
@@ -255,10 +303,12 @@ export class ViewLogin extends LitElement {
 
   render() {
     const domain = detectTenantDomain();
+    const busy = this.loading || this.ssoLoading;
+
     return html`
       <div class="card">
         <div class="tenant-badge">uMail • ${domain}</div>
-        <h2>Instant Phone Sign-In</h2>
+        <h2>${this.ssoLoading ? 'Completing UMANG SSO...' : 'Instant Phone Sign-In'}</h2>
         <p class="subtext">
           Enter your Lesotho phone number to receive a 6-digit UMANG OTP and open your
           <strong>@${domain}</strong> inbox.
@@ -273,11 +323,11 @@ export class ViewLogin extends LitElement {
                 id="phone"
                 type="tel"
                 inputmode="numeric"
-                placeholder="57284264"
+                placeholder="5xxxxxxx"
                 .value="${this.phone}"
                 @input="${this.handleInput}"
                 autocomplete="tel-local"
-                ?disabled="${this.loading}"
+                ?disabled="${busy}"
               />
             </div>
             <div class="error">${this.error}</div>
@@ -287,39 +337,37 @@ export class ViewLogin extends LitElement {
             <button
               type="button"
               class="channel-btn ${this.channel === 'whatsapp' ? 'active' : ''}"
+              ?disabled="${busy}"
               @click=${() => (this.channel = 'whatsapp')}>
               💬 WhatsApp OTP
             </button>
             <button
               type="button"
               class="channel-btn ${this.channel === 'sms' ? 'active' : ''}"
+              ?disabled="${busy}"
               @click=${() => (this.channel = 'sms')}>
               📱 SMS Gateway
             </button>
           </div>
 
-          <div class="quick-accounts">
-            <strong>Provisioned @${domain} Test Identities:</strong>
-            <div class="pill-row">
-              <button type="button" class="acct-pill" @click=${() => this.selectQuickPhone('57284264')}>
-                +266 57284264 (admin@liparola.org)
-              </button>
-              <button type="button" class="acct-pill" @click=${() => this.selectQuickPhone('57893042')}>
-                +266 57893042 (khahliso@liparola.org)
-              </button>
-              <button type="button" class="acct-pill" @click=${() => this.selectQuickPhone('58088117')}>
-                +266 58088117 (info@liparola.org)
-              </button>
-            </div>
-          </div>
-
           <button
             type="submit"
             class="submit-btn"
-            ?disabled="${this.phone.length !== 8 || this.loading}">
+            ?disabled="${this.phone.length !== 8 || busy}">
             ${this.loading ? 'Dispatching UMANG OTP...' : 'Send Instant OTP'}
           </button>
         </form>
+
+        <div class="divider">or federated oidc</div>
+
+        <button
+          type="button"
+          class="sso-btn"
+          ?disabled="${busy}"
+          @click="${this.handleUmangSso}">
+          <span class="sso-pill">U</span>
+          ${this.ssoLoading ? 'Signing in via UMANG...' : 'Continue with UMANG SSO'}
+        </button>
 
         <div class="footer">
           First time accessing your organization inbox?

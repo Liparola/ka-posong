@@ -4,9 +4,21 @@
 # ============================================================================
 set -euo pipefail
 
-CF_TOKEN="replace-with-cloudflare-api-token"
+CF_TOKEN="${CF_API_TOKEN:-}"
 SENDER="${1:-admin@liparola.org}"
-RCPT="${2:-kjamaliehe@gmail.com}"
+RCPT="${2:-${TEST_RECIPIENT_EMAIL:-}}"
+
+if [[ -z "${CF_TOKEN}" ]]; then
+  echo "❌ ERROR: CF_API_TOKEN environment variable is required." >&2
+  echo "   Export CF_API_TOKEN='<your-cloudflare-email-sending-token>' before running this script." >&2
+  exit 1
+fi
+
+if [[ -z "${RCPT}" ]]; then
+  echo "❌ ERROR: TEST_RECIPIENT_EMAIL environment variable (or 2nd CLI argument) is required." >&2
+  echo "   Usage: CF_API_TOKEN=... TEST_RECIPIENT_EMAIL=recipient@example.com $0 [sender@domain]" >&2
+  exit 1
+fi
 
 echo "=================================================================="
 echo "🔍 PROBING CLOUDFLARE SMTPS (PORT 465) FOR DOMAIN: ${SENDER}"

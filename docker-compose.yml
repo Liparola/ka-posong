@@ -9,8 +9,7 @@ services:
     container_name: kaposong-traefik
     restart: unless-stopped
     ports:
-      - "8443:8443"
-      - "8088:8080"
+      - "127.0.0.1:8088:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
@@ -34,14 +33,16 @@ services:
     env_file:
       - .env
     environment:
-      - RUST_LOG=info,rust_control_plane=debug
+      - RUST_LOG=info,rust_control_plane=info
+      - HOST=0.0.0.0
+      - PORT=8443
       - DATABASE_URL=sqlite:///data/control_plane.db?mode=rwc
       - STALWART_API_URL=http://172.28.0.20:8080
       - STALWART_SMTP_ADDR=172.28.0.20:25
       - UMANG_OTP_BRIDGE_URL=http://172.28.0.40:3001
       - UMAIL_STATIC_DIR=/app/umail-dist
     ports:
-      - "3000:3000"
+      - "127.0.0.1:8443:8443"
     volumes:
       - control-plane-db:/data
       - ./domains:/app/domains
@@ -63,11 +64,11 @@ services:
     env_file:
       - .env
     ports:
-      - "2525:25"
-      - "587:587"
-      - "143:143"
-      - "993:993"
-      - "8080:8080"
+      - "127.0.0.1:2525:25"
+      - "127.0.0.1:587:587"
+      - "127.0.0.1:143:143"
+      - "127.0.0.1:993:993"
+      - "127.0.0.1:8080:8080"
     volumes:
       - stalwart-data:/opt/stalwart-mail
       - ./stalwart/config.toml:/opt/stalwart-mail/etc/config.toml:ro
@@ -79,7 +80,7 @@ services:
   # 4. SNAPPYMAIL MULTI-DOMAIN WEBMAIL (Fallback / Admin IMAP Webmail)
   # --------------------------------------------------------------------------
   snappymail:
-    image: djmaze/snappymail:latest
+    image: djmaze/snappymail:v2.38.2
     container_name: kaposong-snappymail
     restart: unless-stopped
     volumes:
@@ -102,7 +103,7 @@ services:
     env_file:
       - .env
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     networks:
       mail_core_net:
         ipv4_address: 172.28.0.40
@@ -117,7 +118,7 @@ services:
     ports:
       - "${TAILSCALE_IP:-127.0.0.1}:5001:5001"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - dockge-data:/app/data
       - ./:/opt/stacks/ka-posong
     environment:

@@ -66,14 +66,36 @@ impl HttpStalwartClient {
         format!("Basic {}", BASE64.encode(creds.as_bytes()))
     }
 
-    /// Generates a deterministic RFC-compliant Ed25519/RSA DKIM public key TXT value
-    /// if Stalwart's DKIM endpoint is still initializing or running in standalone mode.
+    /// Generates a deterministic Ed25519 DKIM record when Stalwart is offline.
+    /// In production or when `ALLOW_DETERMINISTIC_DKIM_FALLBACK != "true"`, prefixes the value
+    /// with an explicit warning flag so operators never publish a non-cryptographic SHA-256
+    /// placeholder to live DNS.
     pub fn generate_deterministic_dkim(domain: &str, selector: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(format!("kaposong-dkim-2026:{}:{}", domain, selector).as_bytes());
         let digest = hasher.finalize();
         let pub_b64 = BASE64.encode(&digest[..]);
-        format!("v=DKIM1; k=ed25519; p={}", pub_b64)
+
+        let app_env = std::env::var("APP_ENV")
+            .or_else(|_| std::env::var("NODE_ENV"))
+            .unwrap_or_else(|_| "development".to_string())
+            .to_lowercase();
+        let allow_unflagged = std::env::var("ALLOW_DETERMINISTIC_DKIM_FALLBACK")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+            && app_env != "production";
+
+        if allow_unflagged {
+            format!(
+                "v=DKIM1; k=ed25519; p={} ; DEV_ONLY_SHA256_PLACEHOLDER_DO_NOT_PUBLISH",
+                pub_b64
+            )
+        } else {
+            format!(
+                "UNPROVISIONED_STALWART_OFFLINE_DO_NOT_PUBLISH_TO_DNS: v=DKIM1; k=ed25519; p={}",
+                pub_b64
+            )
+        }
     }
 }
 
@@ -118,6 +140,7 @@ impl StalwartClient for HttpStalwartClient {
             "algorithm": "ed25519"
         });
         let mut dkim_txt = Self::generate_deterministic_dkim(domain, &selector);
+        let mut dkim_from_stalwart = false;
 
         if let Ok(resp) = self
             .http
@@ -130,8 +153,16 @@ impl StalwartClient for HttpStalwartClient {
             if let Ok(json_val) = resp.json::<serde_json::Value>().await {
                 if let Some(pk) = json_val.get("public_key").and_then(|v| v.as_str()) {
                     dkim_txt = format!("v=DKIM1; k=ed25519; p={}", pk);
+                    dkim_from_stalwart = true;
                 }
             }
+        }
+
+        if !dkim_from_stalwart {
+            tracing::warn!(
+                "[StalwartClient] Stalwart DKIM API unreachable for domain '{}'; recorded flagged offline placeholder instead of live Ed25519 key",
+                domain
+            );
         }
 
         Ok(DkimProvisionResult {

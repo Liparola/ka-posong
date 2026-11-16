@@ -1,5 +1,6 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
+import { detectTenantDomain } from '../services/auth';
 
 @customElement('splash-screen')
 export class SplashScreen extends LitElement {
@@ -84,6 +85,7 @@ export class SplashScreen extends LitElement {
   `;
 
   render() {
+    const domain = detectTenantDomain();
     return html`
       <div class="logo-container">
         <svg viewBox="0 0 100 100">
@@ -92,8 +94,8 @@ export class SplashScreen extends LitElement {
           <path d="M20 32 L50 54 L80 32" fill="none" stroke="#ffd700" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
       </div>
-      <div class="brand-title">uMail • ka-posong</div>
-      <div class="brand-sub">Liparola Instant Business Mail &amp; UMANG Identity</div>
+      <div class="brand-title">uMail • ${domain}</div>
+      <div class="brand-sub">ka-posong Instant Business Mail &amp; UMANG Identity</div>
       <div class="loading-bar">
         <div class="loading-progress"></div>
       </div>

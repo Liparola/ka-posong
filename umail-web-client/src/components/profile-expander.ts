@@ -1,7 +1,7 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { router } from '../router/index';
-import { authService, ClientInfo } from '../services/auth';
+import { authService, detectTenantDomain, ClientInfo } from '../services/auth';
 
 @customElement('profile-expander')
 export class ProfileExpander extends LitElement {
@@ -108,9 +108,9 @@ export class ProfileExpander extends LitElement {
     authService.removeEventListener('auth-changed', this._authHandler);
   }
 
-  private _handleSignOut() {
+  private async _handleSignOut() {
     this.isExpanded = false;
-    authService.signOut();
+    await authService.signOut();
     router.navigate('app://login');
   }
 
@@ -123,7 +123,7 @@ export class ProfileExpander extends LitElement {
     const email = this.user?.email ?? '—';
     const phone = this.user?.phone ?? '';
     const clientId = this.user?.clientId ?? '—';
-    const domain = this.user?.domain ?? 'liparola.org';
+    const domain = this.user?.domain ?? detectTenantDomain();
 
     return html`
       <div class="profile-container">

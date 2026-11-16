@@ -22,7 +22,7 @@ export class ViewOtp extends LitElement {
   @state() private loading = false;
   @state() private resendCountdown = 30;
   @state() private emailHint = '';
-  @state() private otpPreview = '';
+  @state() private deliveryChannel = '';
 
   @query('#otp-form') private otpForm?: HTMLFormElement;
   @query('#otp-input') private otpInput?: HTMLInputElement;
@@ -169,9 +169,9 @@ export class ViewOtp extends LitElement {
     const hintRaw = sessionStorage.getItem(PENDING_OTP_HINT_KEY);
     if (hintRaw) {
       try {
-        const parsed = JSON.parse(hintRaw) as { email?: string; otpPreview?: string };
+        const parsed = JSON.parse(hintRaw) as { email?: string; channel?: string };
         this.emailHint = parsed.email ?? '';
-        this.otpPreview = parsed.otpPreview ?? '';
+        this.deliveryChannel = parsed.channel ?? '';
       } catch {
         // ignore
       }
@@ -246,12 +246,6 @@ export class ViewOtp extends LitElement {
     this.error = '';
   }
 
-  private fillDevOtp() {
-    if (this.otpPreview) {
-      this.otp = this.otpPreview;
-    }
-  }
-
   private async handleSubmit(e: Event) {
     e.preventDefault();
     this.stopSmsOtpListener();
@@ -288,8 +282,8 @@ export class ViewOtp extends LitElement {
     this.error = '';
     try {
       const resp = await authService.requestOtp(this.pendingPhone);
-      if (resp.dev_otp_preview) {
-        this.otpPreview = resp.dev_otp_preview;
+      if (resp.channel) {
+        this.deliveryChannel = resp.channel;
       }
       this.startTimer();
       this.startSmsOtpListener();
@@ -318,20 +312,11 @@ export class ViewOtp extends LitElement {
           ? html`<div class="email-target">Inbox: ${this.emailHint}</div>`
           : ''}
 
-        ${this.otpPreview
-          ? html`
-              <div class="dev-banner" @click=${this.fillDevOtp} title="Click to auto-fill OTP">
-                🧪 <strong>UMANG Dev Console OTP:</strong> <code>${this.otpPreview}</code>
-                <span style="text-decoration:underline; margin-left:4px;">(Tap to fill)</span>
-              </div>
-            `
-          : ''}
-
         <form id="otp-form" method="POST" @submit="${this.handleSubmit}">
           <div class="input-group">
             <label for="otp-input">Verification Code</label>
             <p id="otp-format-hint" class="field-hint">
-              Enter the 6-digit code sent to <strong>${this.pendingPhone}</strong>.<br />
+              Enter the 6-digit code sent via <strong>${(this.deliveryChannel || 'UMANG').toUpperCase()}</strong> to <strong>${this.pendingPhone}</strong>.<br />
               <a
                 href="#"
                 @click="${this.goBack}"

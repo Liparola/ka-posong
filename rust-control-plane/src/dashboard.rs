@@ -1,18 +1,236 @@
 // ============================================================================
 // KA-POSONG EMBEDDED HTMX + TAILWIND MANAGERIAL DASHBOARD (src/dashboard.rs)
-// Served at GET /ops (Protected by DEVOPS_MASTER / Tailscale CGNAT Subnet)
+// Served at GET /ops (Protected by DEVOPS_MASTER Key / Signed HttpOnly Cookie)
+// Zero secrets embedded in HTML or client-side JavaScript.
 // ============================================================================
 
 use axum::{
+    body::Bytes,
     extract::State,
-    response::{Html, IntoResponse},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Json, Redirect, Response},
 };
+use serde::Deserialize;
 use sqlx::Row;
 use std::sync::Arc;
 
-use crate::AppState;
+use crate::{
+    auth::{
+        constant_time_eq, create_ops_session_token, resolve_auth_context, AuthContext, Role,
+        OPS_SESSION_COOKIE,
+    },
+    AppState,
+};
 
-pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Debug, Deserialize)]
+struct OpsLoginPayload {
+    master_key: String,
+}
+
+fn escape_html(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn mask_secret(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    if chars.len() <= 12 {
+        return "••••••••".to_string();
+    }
+    let prefix: String = chars.iter().take(10).collect();
+    let suffix: String = chars.iter().skip(chars.len() - 4).collect();
+    format!("{}••••{}", prefix, suffix)
+}
+
+fn percent_decode_form(input: &str) -> String {
+    let replaced = input.replace('+', " ");
+    let bytes = replaced.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn extract_form_field(body: &[u8], field_name: &str) -> Option<String> {
+    let raw = std::str::from_utf8(body).ok()?;
+    for pair in raw.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if percent_decode_form(k) == field_name {
+                return Some(percent_decode_form(v));
+            }
+        }
+    }
+    None
+}
+
+fn is_https_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-Forwarded-Proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
+fn render_ops_login_html(has_error: bool) -> Html<String> {
+    let err_banner = if has_error {
+        r#"<div class="mb-4 p-3 rounded-lg bg-rose-500/15 border border-rose-500/40 text-rose-200 text-xs font-semibold">Invalid DevOps Master Key. Authentication denied.</div>"#
+    } else {
+        ""
+    };
+
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ka-posong Control Plane Sign In | Liparola SaaS</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-6 font-sans">
+    <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-8">
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/20 text-purple-300 text-xs font-bold uppercase tracking-wider mb-4">
+            Liparola DevOps Guard
+        </div>
+        <h1 class="text-2xl font-bold text-white mb-1">ka-posong Control Plane</h1>
+        <p class="text-sm text-slate-400 mb-6">Operator authentication is required to access multi-tenant mail, DNS, and UMANG identity controls.</p>
+        {err_banner}
+        <form method="POST" action="/ops/login" class="space-y-4">
+            <div>
+                <label for="master_key" class="block text-xs font-bold uppercase text-slate-400 mb-1.5">DevOps Master API Key</label>
+                <input id="master_key" name="master_key" type="password" required autocomplete="current-password" placeholder="Enter master key" class="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-sm text-white focus:outline-none focus:border-purple-500" />
+            </div>
+            <button type="submit" class="w-full py-2.5 bg-[#6200ee] hover:bg-purple-700 text-white font-bold rounded-xl text-sm transition">
+                Authenticate Ops Session
+            </button>
+        </form>
+        <div class="mt-6 pt-4 border-t border-slate-800 flex items-center justify-between text-xs text-slate-500">
+            <span>UMANG Tenant: tnt_ka_posong</span>
+            <a href="/umail" class="text-purple-400 hover:underline">uMail Client &rarr;</a>
+        </div>
+    </div>
+</body>
+</html>"#,
+        err_banner = err_banner
+    ))
+}
+
+/// POST /ops/login
+/// Validates `MASTER_DEVOPS_KEY` in constant time and issues an `HttpOnly; SameSite=Strict` session cookie.
+pub async fn ops_login_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_json = content_type.contains("application/json");
+
+    let submitted_key = if is_json {
+        serde_json::from_slice::<OpsLoginPayload>(&body)
+            .map(|p| p.master_key)
+            .unwrap_or_default()
+    } else {
+        extract_form_field(&body, "master_key").unwrap_or_default()
+    };
+
+    if submitted_key.trim().is_empty()
+        || !constant_time_eq(submitted_key.trim(), &state.master_devops_key)
+    {
+        if is_json {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "Invalid DevOps Master Key" })),
+            )
+                .into_response();
+        }
+        return (StatusCode::UNAUTHORIZED, render_ops_login_html(true)).into_response();
+    }
+
+    let session_token = create_ops_session_token(&state.jwt_secret);
+    let secure_attr = if is_https_request(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie_val = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800{}",
+        OPS_SESSION_COOKIE, session_token, secure_attr
+    );
+
+    if is_json {
+        let mut resp = (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "authenticated": true,
+                "role": "DEVOPS_MASTER"
+            })),
+        )
+            .into_response();
+        if let Ok(hv) = HeaderValue::from_str(&cookie_val) {
+            resp.headers_mut().insert(header::SET_COOKIE, hv);
+        }
+        return resp;
+    }
+
+    let mut resp = Redirect::to("/ops").into_response();
+    if let Ok(hv) = HeaderValue::from_str(&cookie_val) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+/// POST /ops/logout
+pub async fn ops_logout_handler(headers: HeaderMap) -> Response {
+    let secure_attr = if is_https_request(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
+    let clear_cookie = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        OPS_SESSION_COOKIE, secure_attr
+    );
+    let mut resp = Redirect::to("/ops").into_response();
+    if let Ok(hv) = HeaderValue::from_str(&clear_cookie) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+/// GET /ops & GET /ops-dashboard
+pub async fn render_ops_dashboard(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let is_master = matches!(
+        resolve_auth_context(&state, &headers).await,
+        Ok(AuthContext {
+            role: Role::DevOpsMaster
+        })
+    );
+
+    if !is_master {
+        return (StatusCode::UNAUTHORIZED, render_ops_login_html(false)).into_response();
+    }
+
     let tenants = sqlx::query(
         "SELECT id, org_name, tier, raw_api_key, max_domains, max_mailboxes, storage_quota_bytes, status, created_at FROM tenants ORDER BY created_at DESC",
     )
@@ -87,12 +305,12 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                         <div class="bg-purple-700 h-2 rounded-full" style="width: {pct}%"></div>
                     </div>
                 </td>
-                <td class="py-3 px-4"><code class="text-xs bg-slate-100 px-2 py-1 rounded text-slate-600">{api_key}</code></td>
+                <td class="py-3 px-4"><code class="text-xs bg-slate-100 px-2 py-1 rounded text-slate-600">{masked_key}</code></td>
                 <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-xs font-semibold bg-emerald-100 text-emerald-800">{status}</span></td>
             </tr>"#,
-            org = org,
-            tid = tid,
-            tier = tier,
+            org = escape_html(&org),
+            tid = escape_html(&tid),
+            tier = escape_html(&tier),
             tier_badge_color = tier_badge_color,
             used_dom = used_dom,
             max_dom = max_dom,
@@ -100,8 +318,8 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             max_mbx = max_mbx,
             quota_gb = quota / (1024 * 1024 * 1024),
             pct = pct,
-            api_key = api_key,
-            status = status
+            masked_key = escape_html(&mask_secret(&api_key)),
+            status = escape_html(&status)
         ));
     }
 
@@ -119,6 +337,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             r#"<span class="px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">PENDING DNS</span>"#
         };
 
+        let esc_dom = escape_html(&dom);
         domain_rows_html.push_str(&format!(
             r#"<tr class="border-b border-slate-100 hover:bg-slate-50/70">
                 <td class="py-3 px-4 font-bold text-purple-900">https://{dom}{umail_path}<br><span class="text-xs font-normal text-slate-500">Tenant: {tid}</span></td>
@@ -131,11 +350,11 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                     </button>
                 </td>
             </tr>"#,
-            dom = dom,
-            umail_path = umail_path,
-            tid = tid,
-            sel = sel,
-            pk = pk,
+            dom = esc_dom,
+            umail_path = escape_html(&umail_path),
+            tid = escape_html(&tid),
+            sel = escape_html(&sel),
+            pk = escape_html(&pk),
             ver_badge = ver_badge
         ));
     }
@@ -150,6 +369,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
         let wa: i64 = m.get("whatsapp_otp_enabled");
         let channel = if wa == 1 { "WhatsApp + SMS" } else { "SMS Only" };
 
+        let esc_email = escape_html(&email);
         mailbox_rows_html.push_str(&format!(
             r#"<tr class="border-b border-slate-100 hover:bg-slate-50/70">
                 <td class="py-2.5 px-4 font-semibold text-slate-800">{email}</td>
@@ -162,12 +382,12 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                     </button>
                 </td>
             </tr>"#,
-            email = email,
-            phone = phone,
-            name = name,
-            role = role,
+            email = esc_email,
+            phone = escape_html(&phone),
+            name = escape_html(&name),
+            role = escape_html(&role),
             channel = channel,
-            tid = tid
+            tid = escape_html(&tid)
         ));
     }
 
@@ -186,6 +406,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             "bg-slate-300 text-slate-700"
         };
 
+        let esc_mid = escape_html(&mid);
         arm_rows_html.push_str(&format!(
             r#"<tr class="border-b border-slate-100">
                 <td class="py-2.5 px-4 font-semibold text-slate-800">{mname}<br><span class="text-xs font-mono text-slate-400">{mid} ({tid})</span></td>
@@ -195,11 +416,11 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                     <button onclick="toggleArm('{mid}')" class="px-3 py-1 rounded-full text-xs font-bold {btn_cls}">{btn_label}</button>
                 </td>
             </tr>"#,
-            mname = mname,
-            mid = mid,
-            tid = tid,
-            url = url,
-            scopes = scopes,
+            mname = escape_html(&mname),
+            mid = esc_mid,
+            tid = escape_html(&tid),
+            url = escape_html(&url),
+            scopes = escape_html(&scopes),
             btn_cls = btn_cls,
             btn_label = btn_label
         ));
@@ -223,9 +444,9 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                     <span class="px-2.5 py-1 bg-white/20 rounded-md text-xs font-bold tracking-wider uppercase">Liparola SaaS</span>
                     <h1 class="text-2xl font-bold tracking-tight">ka-posong Multi-Tenant Mail &amp; UMANG Control Plane</h1>
                 </div>
-                <p class="text-purple-100 text-sm mt-1">Stalwart Core Engine • Tailscale Funnel Ingress ({hostname}) • UMANG Phone+OTP Identity</p>
+                <p class="text-purple-100 text-sm mt-1">Stalwart Core Engine • Tailscale Funnel Ingress ({hostname}) • UMANG Core Tenant ({umang_tid})</p>
             </div>
-            <div class="flex items-center gap-3">
+            <div class="flex flex-wrap items-center gap-3">
                 <a href="/umail" class="px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">Open uMail PWA (/umail)</a>
                 <button onclick="exportAllDns()" class="px-4 py-2 bg-white/15 hover:bg-white/25 rounded-lg text-sm font-semibold transition">
                     📤 Export All DNS
@@ -233,6 +454,9 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 <button onclick="document.getElementById('onboardModal').showModal()" class="px-4 py-2 bg-amber-400 hover:bg-amber-300 text-slate-950 rounded-lg text-sm font-bold shadow transition">
                     + Onboard New Client Domain
                 </button>
+                <form method="POST" action="/ops/logout" class="inline">
+                    <button type="submit" class="px-3.5 py-2 bg-slate-950/40 hover:bg-slate-950/60 rounded-lg text-xs font-bold transition">Sign Out</button>
+                </form>
             </div>
         </div>
     </header>
@@ -258,7 +482,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-200/80 border-l-4 border-l-amber-500">
                 <div class="text-xs font-bold uppercase text-slate-400">Extending Arm Modules</div>
                 <div class="text-3xl font-extrabold text-slate-900 mt-1">{arm_count}</div>
-                <div class="text-xs text-slate-500 mt-1">CRM, Billing &amp; WhatsApp Hooks</div>
+                <div class="text-xs text-slate-500 mt-1">UMANG Core &amp; WhatsApp Hooks</div>
             </div>
         </div>
 
@@ -266,7 +490,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
         <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
             <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
                 <h2 class="font-bold text-lg text-slate-800">1. Multi-Tenant Organizations &amp; Business Tier Quotas</h2>
-                <span class="text-xs text-slate-400">Mirrored to Stalwart Principal &amp; Quota Records</span>
+                <span class="text-xs text-slate-400">Mirrored to Stalwart Principal &amp; UMANG Core</span>
             </div>
             <div class="overflow-x-auto">
                 <table class="w-full text-left border-collapse">
@@ -276,7 +500,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                             <th class="py-3 px-4">Business Tier</th>
                             <th class="py-3 px-4">Domains</th>
                             <th class="py-3 px-4">Mailbox Quota Usage</th>
-                            <th class="py-3 px-4">Scoped API Key</th>
+                            <th class="py-3 px-4">Scoped API Key (Masked)</th>
                             <th class="py-3 px-4">Status</th>
                         </tr>
                     </thead>
@@ -392,12 +616,8 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                     </div>
                     <div>
                         <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Admin Phone (UMANG +266)</label>
-                        <input name="admin_phone" required placeholder="+26658000001" class="w-full px-3 py-2 border rounded-lg text-sm"/>
+                        <input name="admin_phone" required placeholder="+2665xxxxxxx" class="w-full px-3 py-2 border rounded-lg text-sm"/>
                     </div>
-                </div>
-                <div>
-                    <label class="block text-xs font-bold uppercase text-slate-600 mb-1">DevOps Master API Key</label>
-                    <input name="api_key" value="{master_key}" class="w-full px-3 py-2 border rounded-lg text-xs font-mono bg-slate-50"/>
                 </div>
                 <pre id="onboardResult" class="hidden bg-slate-900 text-emerald-400 p-3 rounded-lg text-xs font-mono overflow-x-auto max-h-60"></pre>
                 <div class="flex justify-end gap-2 pt-2">
@@ -415,21 +635,20 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             <form onsubmit="submitMailbox(event)" class="space-y-3">
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Tenant ID</label>
-                    <input name="tenant_id" required placeholder="tnt_liparola_org" value="tnt_liparola_org" class="w-full px-3 py-2 border rounded-lg text-sm font-mono"/>
+                    <input name="tenant_id" required placeholder="tnt_liparola_org" class="w-full px-3 py-2 border rounded-lg text-sm font-mono"/>
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Email Address</label>
-                    <input name="email" type="email" required placeholder="user@liparola.org" class="w-full px-3 py-2 border rounded-lg text-sm"/>
+                    <input name="email" type="email" required placeholder="user@domain.co.ls" class="w-full px-3 py-2 border rounded-lg text-sm"/>
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Lesotho Phone (+266########)</label>
-                    <input name="phone" required placeholder="+26657284264" class="w-full px-3 py-2 border rounded-lg text-sm"/>
+                    <input name="phone" required placeholder="+2665xxxxxxx" class="w-full px-3 py-2 border rounded-lg text-sm"/>
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 mb-1">Display Name</label>
-                    <input name="display_name" required placeholder="Khahliso Ramotoai" class="w-full px-3 py-2 border rounded-lg text-sm"/>
+                    <input name="display_name" required placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg text-sm"/>
                 </div>
-                <input type="hidden" name="api_key" value="{master_key}"/>
                 <div class="flex justify-end gap-2 pt-3">
                     <button type="button" onclick="document.getElementById('mailboxModal').close()" class="px-4 py-2 border rounded-lg text-sm">Cancel</button>
                     <button type="submit" class="px-4 py-2 bg-[#6200ee] text-white rounded-lg text-sm font-bold">Create Mailbox</button>
@@ -514,7 +733,9 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             showDnsTab('table');
 
             try {{
-                const resp = await fetch('/api/v1/domains/' + dom + '/dns');
+                const resp = await fetch('/api/v1/domains/' + encodeURIComponent(dom) + '/dns', {{
+                    credentials: 'same-origin'
+                }});
                 if (!resp.ok) throw new Error(await resp.text());
                 const data = await resp.json();
                 currentDomainDns = data;
@@ -525,17 +746,43 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 for (const rec of data.bundle.records) {{
                     const tr = document.createElement('tr');
                     tr.className = 'hover:bg-slate-50/70';
-                    const prioText = rec.priority !== null && rec.priority !== undefined ? rec.priority : '-';
-                    const valClean = (rec.value || '').replace(/'/g, "\\'");
-                    tr.innerHTML = 
-                        '<td class="p-2.5"><span class="px-1.5 py-0.5 rounded font-bold bg-slate-100 text-slate-800">' + rec.record_type + '</span></td>' +
-                        '<td class="p-2.5 font-bold text-purple-900">' + rec.host + '</td>' +
-                        '<td class="p-2.5 text-slate-600">' + prioText + '</td>' +
-                        '<td class="p-2.5 max-w-xs truncate text-slate-700" title="' + valClean + '">' + rec.value + '</td>' +
-                        '<td class="p-2.5 text-slate-500 font-sans text-xs">' + rec.purpose + '</td>' +
-                        '<td class="p-2.5">' +
-                            '<button onclick="navigator.clipboard.writeText(\'' + valClean + '\'); alert(\'Copied value to clipboard!\');" class="px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-semibold">Copy</button>' +
-                        '</td>';
+
+                    const tdType = document.createElement('td');
+                    tdType.className = 'p-2.5';
+                    const badge = document.createElement('span');
+                    badge.className = 'px-1.5 py-0.5 rounded font-bold bg-slate-100 text-slate-800';
+                    badge.textContent = rec.record_type;
+                    tdType.appendChild(badge);
+
+                    const tdHost = document.createElement('td');
+                    tdHost.className = 'p-2.5 font-bold text-purple-900';
+                    tdHost.textContent = rec.host;
+
+                    const tdPrio = document.createElement('td');
+                    tdPrio.className = 'p-2.5 text-slate-600';
+                    tdPrio.textContent = (rec.priority !== null && rec.priority !== undefined) ? String(rec.priority) : '-';
+
+                    const tdVal = document.createElement('td');
+                    tdVal.className = 'p-2.5 max-w-xs truncate text-slate-700';
+                    tdVal.title = rec.value || '';
+                    tdVal.textContent = rec.value || '';
+
+                    const tdPurpose = document.createElement('td');
+                    tdPurpose.className = 'p-2.5 text-slate-500 font-sans text-xs';
+                    tdPurpose.textContent = rec.purpose || '';
+
+                    const tdAction = document.createElement('td');
+                    tdAction.className = 'p-2.5';
+                    const copyBtn = document.createElement('button');
+                    copyBtn.className = 'px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-semibold';
+                    copyBtn.textContent = 'Copy';
+                    copyBtn.onclick = () => {{
+                        navigator.clipboard.writeText(rec.value || '');
+                        alert('Copied value to clipboard!');
+                    }};
+                    tdAction.appendChild(copyBtn);
+
+                    tr.append(tdType, tdHost, tdPrio, tdVal, tdPurpose, tdAction);
                     tbody.appendChild(tr);
                 }}
 
@@ -589,7 +836,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
         async function exportAllDns() {{
             try {{
                 const resp = await fetch('/api/v1/admin/dns/export-all', {{
-                    headers: {{ 'X-API-Key': '{master_key}' }}
+                    credentials: 'same-origin'
                 }});
                 if (!resp.ok) throw new Error(await resp.text());
                 const data = await resp.json();
@@ -614,7 +861,7 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             const f = e.target;
             const resBox = document.getElementById('onboardResult');
             resBox.classList.remove('hidden');
-            resBox.textContent = 'Provisioning in Stalwart & generating DKIM records...';
+            resBox.textContent = 'Provisioning in Stalwart & syncing with UMANG Core...';
             const payload = {{
                 organization_name: f.organization_name.value,
                 primary_domain: f.primary_domain.value,
@@ -625,7 +872,8 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
             }};
             const resp = await fetch('/api/v1/admin/tenants', {{
                 method: 'POST',
-                headers: {{ 'Content-Type': 'application/json', 'X-API-Key': f.api_key.value }},
+                credentials: 'same-origin',
+                headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify(payload)
             }});
             const data = await resp.json();
@@ -644,9 +892,10 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 display_name: f.display_name.value,
                 password_hash_or_plain: 'umang_sso_secret'
             }};
-            const resp = await fetch(`/api/v1/tenants/${{tid}}/mailboxes`, {{
+            const resp = await fetch(`/api/v1/tenants/${{encodeURIComponent(tid)}}/mailboxes`, {{
                 method: 'POST',
-                headers: {{ 'Content-Type': 'application/json', 'X-API-Key': f.api_key.value }},
+                credentials: 'same-origin',
+                headers: {{ 'Content-Type': 'application/json' }},
                 body: JSON.stringify(payload)
             }});
             if (resp.ok) {{
@@ -661,9 +910,9 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
                 return;
             }}
             try {{
-                const resp = await fetch(`/api/v1/mailboxes/${{email}}`, {{
+                const resp = await fetch(`/api/v1/mailboxes/${{encodeURIComponent(email)}}`, {{
                     method: 'DELETE',
-                    headers: {{ 'X-API-Key': '{master_key}' }}
+                    credentials: 'same-origin'
                 }});
                 if (resp.ok) {{
                     alert(`Mailbox "${{email}}" has been permanently deleted.`);
@@ -677,16 +926,17 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
         }}
 
         async function toggleArm(moduleId) {{
-            await fetch(`/api/v1/admin/arms/${{moduleId}}/toggle`, {{
+            await fetch(`/api/v1/admin/arms/${{encodeURIComponent(moduleId)}}/toggle`, {{
                 method: 'POST',
-                headers: {{ 'X-API-Key': '{master_key}' }}
+                credentials: 'same-origin'
             }});
             window.location.reload();
         }}
     </script>
 </body>
 </html>"#,
-        hostname = state.primary_mail_hostname,
+        hostname = escape_html(&state.primary_mail_hostname),
+        umang_tid = escape_html(&state.umang_tenant_id),
         tenant_count = tenants.len(),
         domain_count = domains.len(),
         mailbox_count = mailboxes.len(),
@@ -694,9 +944,8 @@ pub async fn render_ops_dashboard(State(state): State<Arc<AppState>>) -> impl In
         tenant_rows_html = tenant_rows_html,
         domain_rows_html = domain_rows_html,
         mailbox_rows_html = mailbox_rows_html,
-        arm_rows_html = arm_rows_html,
-        master_key = state.master_devops_key
+        arm_rows_html = arm_rows_html
     );
 
-    Html(html)
+    Html(html).into_response()
 }

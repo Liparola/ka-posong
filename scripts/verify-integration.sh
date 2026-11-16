@@ -1,73 +1,126 @@
 #!/usr/bin/env bash
 # ============================================================================
-# KA-POSONG END-TO-END AUTOMATED SMOKE TEST & INTEGRATION VERIFIER
-# Verifies:
-# 1. UMANG OTP Delivery Bridge (WhatsApp AetherWA + Huawei Router SMS)
-# 2. Rust Control Plane & SQLite Persistence (Flagship liparola.org + Test Tenant)
-# 3. Business Tier Quota Enforcement (HTTP 402 Payment Required on limit overflow)
-# 4. UMANG Phone-to-Mailbox OTP Request & 8-Hour JWT Verification
-# 5. Cloudflare Email Worker HMAC-Signed RFC822 MIME Tunnel Ingestion (/ingest-email)
-# 6. uMail JMAP/REST Client Inbox Verification & Outbound Mail Dispatch
+# KA-POSONG <-> UMANG CORE END-TO-END INTEGRATION & HARDENING VERIFIER
+# Verifies both Test/Dev E2E Flows and Production Security Hardening Guarantees:
+#   1. UMANG Core Engine (:UMANG_PORT) + ka-posong Rust Control Plane (:TEST_PORT)
+#   2. Business Tier Quota Enforcement (HTTP 402 Payment Required on limit overflow)
+#   3. Tenant-Delegated Phone+OTP Flow (`tnt_ka_posong`) & Single-Use Anti-Replay
+#   4. OIDC Discovery, Client SDK Proxy & OAuth 2.0 + PKCE (S256) SSO Exchange
+#   5. Bidirectional HMAC-SHA256 Extending Arms Webhooks & Global JTI Revocation
+#   6. Cloudflare Email Worker HMAC-Signed RFC822 MIME Tunnel (`/ingest-email`)
+#   7. Strict Production Mode Hardening (`ALLOW_DEV_OTP_PREVIEW=false`):
+#      - `/ops` 401 gate + HttpOnly cookie login + zero leaked keys in HTML
+#      - Zero unauthenticated PII on `/api/v1/domains/:domain/identities`
+#      - Zero `dev_otp_preview` / `web_otp_hint` & masked `email_hint`
+#      - 5-attempt OTP brute-force lockout (`429 Too Many Requests`)
 # ============================================================================
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UMANG_DIR="/home/aurum/Documents/Projects/Business/Liparola FC/Umang"
 cd "$ROOT_DIR"
 
+BIN_PATH="$ROOT_DIR/rust-control-plane/target/release/rust-control-plane"
+if [ ! -x "$BIN_PATH" ]; then
+    BIN_PATH="$ROOT_DIR/rust-control-plane/target/debug/rust-control-plane"
+fi
+
 PORT="${TEST_PORT:-3090}"
-BRIDGE_PORT="${TEST_BRIDGE_PORT:-3091}"
+UMANG_PORT="${TEST_UMANG_PORT:-3091}"
+PROD_PORT="${TEST_PROD_PORT:-3092}"
+PROD_UMANG_PORT="${TEST_PROD_UMANG_PORT:-3093}"
+
 MASTER_KEY="devops-test-master-key-2026"
+INTERNAL_KEY="umang-test-internal-key-2026"
 CF_SECRET="cf-tunnel-hmac-secret-2026"
-JWT_SECRET="umang-jwt-test-secret-2026"
+JWT_SECRET="umang-jwt-test-secret-2026-32bytes"
+WEBHOOK_SECRET="whsec_kaposong_umang_arm_2026"
+COOKIE_JAR="/tmp/kaposong_ops_cookies_$$.txt"
+
 DB_FILE="/tmp/kaposong_verify_$$.db"
+UMANG_DB_FILE="/tmp/umang_verify_$$.db"
+PROD_DB_FILE="/tmp/kaposong_prod_verify_$$.db"
+PROD_UMANG_DB_FILE="/tmp/umang_prod_verify_$$.db"
+
+CP_PID=""
+UMANG_PID=""
+PROD_CP_PID=""
+PROD_UMANG_PID=""
 
 cleanup() {
-    if [ -n "${CP_PID:-}" ] && kill -0 "$CP_PID" 2>/dev/null; then
-        kill "$CP_PID" 2>/dev/null || true
-    fi
-    if [ -n "${BRIDGE_PID:-}" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
-        kill "$BRIDGE_PID" 2>/dev/null || true
-    fi
-    rm -f "$DB_FILE" "$DB_FILE-shm" "$DB_FILE-wal"
+    for pid in "$CP_PID" "$UMANG_PID" "$PROD_CP_PID" "$PROD_UMANG_PID"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    rm -f "$COOKIE_JAR" \
+        "$DB_FILE" "$DB_FILE-shm" "$DB_FILE-wal" \
+        "$UMANG_DB_FILE" "$UMANG_DB_FILE-shm" "$UMANG_DB_FILE-wal" \
+        "$PROD_DB_FILE" "$PROD_DB_FILE-shm" "$PROD_DB_FILE-wal" \
+        "$PROD_UMANG_DB_FILE" "$PROD_UMANG_DB_FILE-shm" "$PROD_UMANG_DB_FILE-wal"
 }
 trap cleanup EXIT
 
-echo "============================================================================"
-echo "🧪 1. Starting UMANG Multi-Channel OTP Delivery Bridge on port ${BRIDGE_PORT}..."
-echo "============================================================================"
-UMANG_BRIDGE_PORT="$BRIDGE_PORT" node "$ROOT_DIR/umang-otp-bridge/src/server.js" &
-BRIDGE_PID=$!
-sleep 1
+wait_for_health() {
+    local url="$1"
+    for _ in $(seq 1 30); do
+        if curl -fsS "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    echo "❌ Timed out waiting for $url"
+    exit 1
+}
 
-curl -fsS "http://127.0.0.1:${BRIDGE_PORT}/api/health" | grep -q '"status":"ok"'
-echo "✅ UMANG OTP Bridge is ONLINE."
+echo "============================================================================"
+echo "🧬 1. Starting UMANG Core Platform (Test Integration Mode) on :${UMANG_PORT}..."
+echo "============================================================================"
+(
+    cd "$UMANG_DIR"
+    NODE_ENV=test \
+    ALLOW_DEV_OTP_PREVIEW=true \
+    PORT="$UMANG_PORT" \
+    HOST="127.0.0.1" \
+    UMANG_DB_PATH="$UMANG_DB_FILE" \
+    JWT_SECRET="$JWT_SECRET" \
+    MASTER_DEVOPS_KEY="$MASTER_KEY" \
+    INTERNAL_SECRET="$INTERNAL_KEY" \
+    UMANG_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+    ENABLE_WHATSAPP_GATEWAY=false \
+    MOCK_SMS=true \
+    node --no-warnings src/server.js
+) >/tmp/umang_verify_$$.log 2>&1 &
+UMANG_PID=$!
+wait_for_health "http://127.0.0.1:${UMANG_PORT}/api/health"
+curl -fsS "http://127.0.0.1:${UMANG_PORT}/api/health" | grep -q '"status":"ok"'
+echo "✅ UMANG Core Engine is ONLINE."
 
 echo "============================================================================"
-echo "🦀 2. Starting ka-posong Rust Control Plane on port ${PORT}..."
+echo "🦀 2. Starting ka-posong Rust Control Plane (:${PORT} -> UMANG :${UMANG_PORT})..."
 echo "============================================================================"
 PORT="$PORT" \
+SECONDARY_PORT=0 \
+ALLOW_DEV_OTP_PREVIEW=true \
 DATABASE_URL="sqlite://${DB_FILE}?mode=rwc" \
 MASTER_DEVOPS_KEY="$MASTER_KEY" \
 BRIDGE_SECRET="$CF_SECRET" \
 JWT_SECRET="$JWT_SECRET" \
-UMANG_OTP_BRIDGE_URL="http://127.0.0.1:${BRIDGE_PORT}" \
+UMANG_CORE_URL="http://127.0.0.1:${UMANG_PORT}" \
+UMANG_TENANT_ID="tnt_ka_posong" \
+UMANG_API_KEY="sk_live_ka_posong_umail_2026" \
+UMANG_CLIENT_ID="umang_pk_ka_posong" \
+UMANG_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
 PRIMARY_MAIL_HOSTNAME="aurum-thinkpad-t440p.tail8fafd0.ts.net" \
 UMAIL_STATIC_DIR="$ROOT_DIR/umail-web-client/dist" \
-"$ROOT_DIR/rust-control-plane/target/debug/rust-control-plane" &
+"$BIN_PATH" >/tmp/kaposong_verify_$$.log 2>&1 &
 CP_PID=$!
-
-for _ in $(seq 1 25); do
-    if curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 0.4
-done
-
+wait_for_health "http://127.0.0.1:${PORT}/api/health"
 HEALTH=$(curl -fsS "http://127.0.0.1:${PORT}/api/health")
 echo "✅ Rust Control Plane Health: $HEALTH"
 
 echo "============================================================================"
-echo "🏢 3. Onboarding New STARTER Tier Client Tenant (lesothotech.co.ls)..."
+echo "🏢 3. Onboarding STARTER Tenant & Verifying HTTP 402 Quota Enforcement..."
 echo "============================================================================"
 ONBOARD_RESP=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/admin/tenants" \
     -H "Content-Type: application/json" \
@@ -82,109 +135,258 @@ ONBOARD_RESP=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/admin/tenants"
     }')
 
 echo "$ONBOARD_RESP" | grep -q '"status":"PROVISIONED"'
-TENANT_ID=$(echo "$ONBOARD_RESP" | sed -n 's/.*"tenant_id":"\([^"]*\)".*/\1/p')
-TENANT_API_KEY=$(echo "$ONBOARD_RESP" | sed -n 's/.*"scoped_api_key_for_extending_arms":"\([^"]*\)".*/\1/p')
-echo "✅ Provisioned Tenant ID: ${TENANT_ID} | Scoped Key: ${TENANT_API_KEY}"
+TENANT_ID=$(echo "$ONBOARD_RESP" | jq -r '.tenant_id')
+TENANT_API_KEY=$(echo "$ONBOARD_RESP" | jq -r '.scoped_api_key_for_extending_arms')
+echo "✅ Provisioned Tenant ID: ${TENANT_ID}"
 
-# Also generate the flagship liparola.org DNS setup file in ./domains/
-mkdir -p "$ROOT_DIR/domains"
-cat <<EOF > "$ROOT_DIR/domains/liparola.org-DNS-SETUP.txt"
-================================================================================
-CLOUDFLARE DNS PROVISIONING BUNDLE FOR FIRST TENANT: liparola.org
-Tailscale Funnel Host: aurum-thinkpad-t440p.tail8fafd0.ts.net (100.83.242.97)
-Firebase Hosting Site: liparola-ls (https://liparola.org & https://liparola.org/umail)
-================================================================================
-
-1. KEEP EXISTING FIREBASE HOSTING RECORDS (DO NOT DELETE):
-   Type: A     | Name: liparola.org | Content: 199.36.158.100          | Proxy: DNS only
-   Type: TXT   | Name: liparola.org | Content: "hosting-site=liparola-ls"
-
-2. ADD CLOUDFLARE EMAIL ROUTING MX RECORDS (Inbound Port 25 Catch-All):
-   Type: MX    | Name: @            | Mail Server: route1.mx.cloudflare.net | Priority: 10
-   Type: MX    | Name: @            | Mail Server: route2.mx.cloudflare.net | Priority: 20
-   Type: MX    | Name: @            | Mail Server: route3.mx.cloudflare.net | Priority: 30
-
-3. ADD SPF, STALWART DKIM & DMARC TXT RECORDS (Anti-Spoofing & Alignment):
-   Type: TXT   | Name: @
-   Content:    "v=spf1 include:_spf.mx.cloudflare.net a:aurum-thinkpad-t440p.tail8fafd0.ts.net ~all"
-
-   Type: TXT   | Name: kaposong._domainkey
-   Content:    "v=DKIM1; k=ed25519; p=hJQosMmIpddr923JaG8n2p3rT7vW9yB2eF5hJ8kL1mN="
-
-   Type: TXT   | Name: _dmarc
-   Content:    "v=DMARC1; p=quarantine; rua=mailto:postmaster@liparola.org"
-
-4. ADD CNAME FOR DIRECT JMAP / WEBMAIL GATEWAY:
-   Type: CNAME | Name: webmail      | Target: aurum-thinkpad-t440p.tail8fafd0.ts.net | Proxy: DNS only
-================================================================================
-EOF
-
-echo "============================================================================"
-echo "🔒 4. Verifying Hard Business Tier Quota Enforcement (HTTP 402 Check)..."
-echo "============================================================================"
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PORT}/api/v1/tenants/${TENANT_ID}/domains" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: ${TENANT_API_KEY}" \
     -d '{"domain_name": "second-domain.co.ls"}')
-
-if [ "$HTTP_CODE" = "402" ]; then
-    echo "✅ STARTER tier secondary domain blocked with HTTP 402 Payment Required as specified."
-else
-    echo "❌ Expected HTTP 402, got $HTTP_CODE"
+if [ "$HTTP_CODE" != "402" ]; then
+    echo "❌ Expected HTTP 402 on STARTER 2nd domain, got $HTTP_CODE"
     exit 1
 fi
+echo "✅ STARTER tier secondary domain blocked with HTTP 402 Payment Required."
 
 echo "============================================================================"
-echo "📱 5. Testing UMANG Phone+OTP Login Flow for Flagship Tenant (liparola.org)..."
+echo "📱 4. Testing Delegated UMANG Core OTP Login (karabomilling.co.ls & liparola.org)..."
 echo "============================================================================"
 OTP_REQ=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/auth/request-otp" \
     -H "Content-Type: application/json" \
-    -d '{"phone": "+26657284264", "domain": "liparola.org", "channel": "whatsapp"}')
-
-OTP_CODE=$(echo "$OTP_REQ" | sed -n 's/.*"dev_otp_preview":"\([0-9]\{6\}\)".*/\1/p')
-echo "✅ Dispatched 6-digit OTP to +26657284264 (admin@liparola.org): ${OTP_CODE}"
+    -d '{"phone": "53872233", "domain": "karabomilling.co.ls", "channel": "whatsapp"}')
+OTP_CODE=$(echo "$OTP_REQ" | jq -r '.dev_otp_preview')
+[ "${#OTP_CODE}" -eq 6 ] || { echo "❌ Expected 6-digit OTP"; exit 1; }
+echo "✅ Dispatched 6-digit OTP via UMANG Core for info@karabomilling.co.ls: ${OTP_CODE}"
 
 VERIFY_RESP=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/auth/verify-otp" \
     -H "Content-Type: application/json" \
-    -d "{\"phone\": \"+26657284264\", \"otp\": \"${OTP_CODE}\", \"domain\": \"liparola.org\"}")
+    -d "{\"phone\": \"+26653872233\", \"otp\": \"${OTP_CODE}\", \"domain\": \"karabomilling.co.ls\"}")
+JWT_TOKEN=$(echo "$VERIFY_RESP" | jq -r '.token')
+[ "$(echo "$VERIFY_RESP" | jq -r '.client.email')" = "info@karabomilling.co.ls" ]
+echo "✅ Verified OTP and issued 8-Hour UMANG JWT for info@karabomilling.co.ls."
 
-JWT_TOKEN=$(echo "$VERIFY_RESP" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-echo "✅ Verified OTP and issued 8-Hour UMANG JWT Session."
-
-# Verify replay protection (second verify with same OTP must return 401)
 REPLAY_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PORT}/api/auth/verify-otp" \
     -H "Content-Type: application/json" \
-    -d "{\"phone\": \"+26657284264\", \"otp\": \"${OTP_CODE}\", \"domain\": \"liparola.org\"}")
-if [ "$REPLAY_CODE" = "401" ]; then
-    echo "✅ OTP Replay Protection verified (second attempt rejected with HTTP 401)."
-else
-    echo "❌ Expected HTTP 401 on OTP replay, got $REPLAY_CODE"
-    exit 1
-fi
+    -d "{\"phone\": \"+26653872233\", \"otp\": \"${OTP_CODE}\", \"domain\": \"karabomilling.co.ls\"}")
+[ "$REPLAY_CODE" = "401" ] || { echo "❌ Expected 401 on OTP replay, got $REPLAY_CODE"; exit 1; }
+echo "✅ Single-use OTP replay protection verified (HTTP 401)."
 
 echo "============================================================================"
-echo "📨 6. Simulating Cloudflare Email Worker Raw RFC822 MIME POST to /ingest-email..."
+echo "🔐 5. Testing OIDC Discovery, Client SDK Proxy & OAuth2 PKCE S256 SSO Flow..."
 echo "============================================================================"
-RAW_MIME=$'From: External Partner <partner@gmail.com>\r\nTo: <admin@liparola.org>\r\nSubject: Maseru Fiber Contract Approval\r\nAuthentication-Results: mx.cloudflare.net; spf=pass; dkim=pass; dmarc=pass\r\n\r\nKhotso Liparola Team, the Maseru enterprise contract has been approved!'
+OIDC_CONF=$(curl -fsS "http://127.0.0.1:${PORT}/.well-known/openid-configuration")
+grep -q '/api/v1/sso/token' <<<"$OIDC_CONF"
+SDK_JS=$(curl -fsS "http://127.0.0.1:${PORT}/sdk/v1/umang.js")
+grep -q 'umang.accounts.id' <<<"$SDK_JS"
+
+PKCE_PAIR=$(node -e '
+  const crypto = require("crypto");
+  const verifier = crypto.randomBytes(32).toString("base64url");
+  const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+  console.log(JSON.stringify({ verifier, challenge }));
+')
+CODE_VERIFIER=$(echo "$PKCE_PAIR" | jq -r '.verifier')
+CODE_CHALLENGE=$(echo "$PKCE_PAIR" | jq -r '.challenge')
+
+SSO_OTP_REQ=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/instances/tnt_ka_posong/auth/request-otp" \
+    -H "Content-Type: application/json" \
+    -d '{"phone": "+26663483311", "domain": "karabomilling.co.ls", "mock": true}')
+SSO_OTP=$(echo "$SSO_OTP_REQ" | jq -r '.dev_otp_preview')
+
+AUTH_CODE_RESP=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/sso/authorize-code" \
+    -H "Content-Type: application/json" \
+    -H "X-Tenant-ID: tnt_ka_posong" \
+    -d "{
+      \"phone\": \"+26663483311\",
+      \"otp\": \"${SSO_OTP}\",
+      \"domain\": \"karabomilling.co.ls\",
+      \"client_id\": \"umang_pk_ka_posong\",
+      \"redirect_uri\": \"https://karabomilling.co.ls/umail/login\",
+      \"code_challenge\": \"${CODE_CHALLENGE}\",
+      \"code_challenge_method\": \"S256\",
+      \"state\": \"teststate123\"
+    }")
+AUTH_CODE=$(echo "$AUTH_CODE_RESP" | jq -r '.code')
+
+SSO_EXCHANGE=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/auth/sso-exchange" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"code\": \"${AUTH_CODE}\",
+      \"code_verifier\": \"${CODE_VERIFIER}\",
+      \"redirect_uri\": \"https://karabomilling.co.ls/umail/login\",
+      \"domain\": \"karabomilling.co.ls\"
+    }")
+SSO_TOKEN=$(echo "$SSO_EXCHANGE" | jq -r '.token')
+[ "$(echo "$SSO_EXCHANGE" | jq -r '.client.email')" = "linka@karabomilling.co.ls" ]
+echo "✅ OAuth2 PKCE S256 exchanged cleanly for linka@karabomilling.co.ls."
+
+echo "============================================================================"
+echo "📡 6. Verifying Bidirectional HMAC Webhooks & Cross-Service Token Revocation..."
+echo "============================================================================"
+BAD_WEBHOOK_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PORT}/api/v1/webhooks/umang" \
+    -H "Content-Type: application/json" \
+    -H "X-Umang-Signature: sha256=deadbeef" \
+    -d '{"event_type":"ping","tenant_id":"tnt_ka_posong"}')
+[ "$BAD_WEBHOOK_CODE" = "401" ] || { echo "❌ Expected 401 on invalid webhook signature, got $BAD_WEBHOOK_CODE"; exit 1; }
+
+SSO_JTI=$(node -e '
+  const p = process.argv[1].split(".")[1];
+  console.log(JSON.parse(Buffer.from(p, "base64url").toString()).jti || "");
+' "$SSO_TOKEN")
+REVOKE_PAYLOAD="{\"event_type\":\"token.revoked\",\"tenant_id\":\"tnt_ka_posong\",\"data\":{\"jti\":\"${SSO_JTI}\"}}"
+REVOKE_SIG=$(node -e '
+  const crypto = require("crypto");
+  console.log("sha256=" + crypto.createHmac("sha256", process.argv[1]).update(process.argv[2]).digest("hex"));
+' "$WEBHOOK_SECRET" "$REVOKE_PAYLOAD")
+
+R1=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/webhooks/umang" \
+    -H "Content-Type: application/json" \
+    -H "X-Umang-Signature: ${REVOKE_SIG}" \
+    -d "$REVOKE_PAYLOAD")
+grep -q '"verified":true' <<<"$R1"
+
+REVOKED_MAIL_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/api/umail/messages?folder=inbox" \
+    -H "Authorization: Bearer ${SSO_TOKEN}")
+[ "$REVOKED_MAIL_CODE" = "401" ] || { echo "❌ Expected 401 after JTI revocation webhook, got $REVOKED_MAIL_CODE"; exit 1; }
+
+# Also test /api/auth/logout on the first session token
+R2=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/auth/logout" \
+    -H "Authorization: Bearer ${JWT_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{}")
+grep -q '"revoked":true' <<<"$R2"
+
+LOGOUT_MAIL_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/api/umail/messages?folder=inbox" \
+    -H "Authorization: Bearer ${JWT_TOKEN}")
+[ "$LOGOUT_MAIL_CODE" = "401" ] || { echo "❌ Expected 401 after /api/auth/logout, got $LOGOUT_MAIL_CODE"; exit 1; }
+echo "✅ HMAC webhook validation & JTI/logout token revocation verified."
+
+echo "============================================================================"
+echo "📨 7. Testing Signed Cloudflare Email Worker RFC822 MIME Ingest & Inbox..."
+echo "============================================================================"
+# Re-authenticate cleanly for inbox check
+OTP_REQ2=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/auth/request-otp" \
+    -H "Content-Type: application/json" \
+    -d '{"phone": "53872233", "domain": "karabomilling.co.ls"}')
+OTP_CODE2=$(echo "$OTP_REQ2" | jq -r '.dev_otp_preview')
+JWT2=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/auth/verify-otp" \
+    -H "Content-Type: application/json" \
+    -d "{\"phone\": \"+26653872233\", \"otp\": \"${OTP_CODE2}\", \"domain\": \"karabomilling.co.ls\"}" | jq -r '.token')
+
+RAW_MIME=$'From: Grain Buyer <buyer@example.com>\r\nTo: <info@karabomilling.co.ls>\r\nSubject: Maseru Roller Meal Order\r\nAuthentication-Results: mx.cloudflare.net; spf=pass; dkim=pass; dmarc=pass\r\n\r\nPlease confirm dispatch of 200 bags.'
+MIME_HMAC=$(node -e '
+  const crypto = require("crypto");
+  console.log(crypto.createHmac("sha256", process.argv[1]).update(process.argv[2], "utf8").digest("hex"));
+' "$CF_SECRET" "$RAW_MIME")
 
 INGEST_RESP=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/ingest-email" \
     -H "Content-Type: message/rfc822" \
     -H "X-Bridge-Secret: ${CF_SECRET}" \
-    -H "X-Envelope-From: partner@gmail.com" \
-    -H "X-Envelope-To: admin@liparola.org" \
+    -H "X-Ingress-HMAC-Signature: ${MIME_HMAC}" \
+    -H "X-Envelope-From: buyer@example.com" \
+    -H "X-Envelope-To: info@karabomilling.co.ls" \
     --data-binary "$RAW_MIME")
+grep -q 'INGESTED' <<<"$INGEST_RESP"
 
-echo "✅ Cloudflare MIME Tunnel Ingest Response: $INGEST_RESP"
-
-echo "============================================================================"
-echo "📬 7. Verifying Message Landed in admin@liparola.org uMail Inbox..."
-echo "============================================================================"
-INBOX_JSON=$(curl -fsS "http://127.0.0.1:${PORT}/api/umail/messages?folder=inbox" \
-    -H "Authorization: Bearer ${JWT_TOKEN}")
-
-echo "$INBOX_JSON" | grep -q "Maseru Fiber Contract Approval"
-echo "✅ Confirmed inbound email 'Maseru Fiber Contract Approval' is in admin@liparola.org inbox with SPF/DMARC PASS!"
+INBOX_RESP=$(curl -fsS "http://127.0.0.1:${PORT}/api/umail/messages?folder=inbox" \
+    -H "Authorization: Bearer ${JWT2}")
+grep -q "Maseru Roller Meal Order" <<<"$INBOX_RESP"
+echo "✅ Cloudflare MIME ingest + authenticated karabomilling inbox verified."
 
 echo "============================================================================"
-echo "🎉 ALL KA-POSONG END-TO-END INTEGRATION TESTS PASSED!"
+echo "🛡️ 8. Verifying Strict Production Hardening Mode (ALLOW_DEV_OTP_PREVIEW=false)..."
+echo "============================================================================"
+(
+    cd "$UMANG_DIR"
+    NODE_ENV=production \
+    ALLOW_DEV_OTP_PREVIEW=false \
+    PORT="$PROD_UMANG_PORT" \
+    HOST="127.0.0.1" \
+    UMANG_DB_PATH="$PROD_UMANG_DB_FILE" \
+    JWT_SECRET="$JWT_SECRET" \
+    MASTER_DEVOPS_KEY="$MASTER_KEY" \
+    INTERNAL_SECRET="$INTERNAL_KEY" \
+    UMANG_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+    ENABLE_WHATSAPP_GATEWAY=false \
+    MOCK_SMS=true \
+    node --no-warnings src/server.js
+) >/tmp/umang_prod_verify_$$.log 2>&1 &
+PROD_UMANG_PID=$!
+wait_for_health "http://127.0.0.1:${PROD_UMANG_PORT}/api/health"
+
+PORT="$PROD_PORT" \
+SECONDARY_PORT=0 \
+ALLOW_DEV_OTP_PREVIEW=false \
+DATABASE_URL="sqlite://${PROD_DB_FILE}?mode=rwc" \
+MASTER_DEVOPS_KEY="$MASTER_KEY" \
+BRIDGE_SECRET="$CF_SECRET" \
+JWT_SECRET="$JWT_SECRET" \
+UMANG_CORE_URL="http://127.0.0.1:${PROD_UMANG_PORT}" \
+UMANG_TENANT_ID="tnt_ka_posong" \
+UMANG_API_KEY="sk_live_ka_posong_umail_2026" \
+UMANG_CLIENT_ID="umang_pk_ka_posong" \
+UMANG_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+PRIMARY_MAIL_HOSTNAME="aurum-thinkpad-t440p.tail8fafd0.ts.net" \
+UMAIL_STATIC_DIR="$ROOT_DIR/umail-web-client/dist" \
+"$BIN_PATH" >/tmp/kaposong_prod_verify_$$.log 2>&1 &
+PROD_CP_PID=$!
+wait_for_health "http://127.0.0.1:${PROD_PORT}/api/health"
+
+# 8a. /ops unauthenticated MUST return 401 and contain ZERO secrets
+OPS_UNAUTH_CODE=$(curl -s -o /tmp/ops_unauth_$$.html -w "%{http_code}" "http://127.0.0.1:${PROD_PORT}/ops")
+[ "$OPS_UNAUTH_CODE" = "401" ] || { echo "❌ Expected 401 on unauth /ops, got $OPS_UNAUTH_CODE"; exit 1; }
+! grep -q "$MASTER_KEY" /tmp/ops_unauth_$$.html || { echo "❌ MASTER_KEY leaked on login page"; exit 1; }
+rm -f /tmp/ops_unauth_$$.html
+
+UMANG_OPS_UNAUTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PROD_UMANG_PORT}/ops")
+[ "$UMANG_OPS_UNAUTH_CODE" = "401" ] || { echo "❌ Expected 401 on UMANG /ops in production, got $UMANG_OPS_UNAUTH_CODE"; exit 1; }
+
+# 8b. /ops/login cookie auth -> 200 and zero leaked master key or full raw_api_key
+LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" -X POST "http://127.0.0.1:${PROD_PORT}/ops/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"master_key\":\"${MASTER_KEY}\"}")
+[ "$LOGIN_CODE" = "200" ] || { echo "❌ Expected 200 on /ops/login, got $LOGIN_CODE"; exit 1; }
+OPS_HTML=$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:${PROD_PORT}/ops")
+grep -q "Dashboard" <<<"$OPS_HTML"
+if grep -q "$MASTER_KEY" <<<"$OPS_HTML"; then
+    echo "❌ MASTER_DEVOPS_KEY leaked into authenticated /ops HTML!"
+    exit 1
+fi
+
+# Also verify UMANG Core /api/webhook-notify enforces HMAC-SHA256 in production
+BAD_NOTIFY_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PROD_UMANG_PORT}/api/webhook-notify" \
+    -H "Content-Type: application/json" \
+    -d '{"phone":"+26653872233","channel":"sms"}')
+[ "$BAD_NOTIFY_CODE" = "401" ] || { echo "❌ Expected 401 on unauth UMANG /api/webhook-notify in prod, got $BAD_NOTIFY_CODE"; exit 1; }
+
+# 8c. Unauthenticated /identities must return empty list; authenticated returns identities
+UNAUTH_IDS=$(curl -fsS "http://127.0.0.1:${PROD_PORT}/api/v1/domains/liparola.org/identities" | jq '.identities | length')
+[ "$UNAUTH_IDS" = "0" ] || { echo "❌ Unauthenticated /identities leaked $UNAUTH_IDS PII records!"; exit 1; }
+AUTH_IDS=$(curl -fsS -H "X-API-Key: ${MASTER_KEY}" "http://127.0.0.1:${PROD_PORT}/api/v1/domains/liparola.org/identities" | jq '.identities | length')
+[ "$AUTH_IDS" -ge 3 ] || { echo "❌ Authenticated /identities failed to return liparola.org staff"; exit 1; }
+
+# 8d. /api/auth/request-otp in production must hide dev_otp_preview and mask email_hint
+PROD_OTP_RESP=$(curl -fsS -X POST "http://127.0.0.1:${PROD_PORT}/api/auth/request-otp" \
+    -H "Content-Type: application/json" \
+    -d '{"phone": "53872233", "domain": "karabomilling.co.ls"}')
+grep -q '"email_hint":"in\*\*\*@karabomilling.co.ls"' <<<"$PROD_OTP_RESP" || { echo "❌ Expected masked email_hint, got $PROD_OTP_RESP"; exit 1; }
+! grep -q 'dev_otp_preview' <<<"$PROD_OTP_RESP" || { echo "❌ dev_otp_preview leaked in production!"; exit 1; }
+! grep -q 'web_otp_hint' <<<"$PROD_OTP_RESP" || { echo "❌ web_otp_hint leaked in production!"; exit 1; }
+
+# 8e. Brute-force 5 bad attempts -> 429 lockout
+for attempt in 1 2 3 4; do
+    BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PROD_PORT}/api/auth/verify-otp" \
+        -H "Content-Type: application/json" \
+        -d '{"phone": "53872233", "otp": "000000", "domain": "karabomilling.co.ls"}')
+    [ "$BAD_CODE" = "401" ] || { echo "❌ Attempt $attempt expected 401, got $BAD_CODE"; exit 1; }
+done
+LOCKOUT_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${PROD_PORT}/api/auth/verify-otp" \
+    -H "Content-Type: application/json" \
+    -d '{"phone": "53872233", "otp": "000000", "domain": "karabomilling.co.ls"}')
+[ "$LOCKOUT_CODE" = "429" ] || { echo "❌ Expected 429 lockout on 5th failure, got $LOCKOUT_CODE"; exit 1; }
+
+echo "✅ Production Hardening Mode verified (401/cookie /ops, zero PII, masked hints, 429 lockout)."
+echo "============================================================================"
+echo "🎉 ALL KA-POSONG <-> UMANG CORE E2E & HARDENING TESTS PASSED!"
 echo "============================================================================"

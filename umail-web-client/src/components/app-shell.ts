@@ -222,6 +222,8 @@ export class AppShell extends LitElement {
 
   connectedCallback() {
     super.connectedCallback();
+    const domain = detectTenantDomain();
+    document.title = `uMail — Instant Business Mail | ${domain}`;
     router.addEventListener('route-changed', (e: Event) => {
       this._currentView = (e as CustomEvent).detail.view;
       this._drawerOpen = false;

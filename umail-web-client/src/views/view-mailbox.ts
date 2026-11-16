@@ -1,7 +1,7 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state, query } from 'lit/decorators.js';
 import { mailService, type MailMessage, type EmailAttachment } from '../services/mail';
-import { authService } from '../services/auth';
+import { authService, detectTenantDomain } from '../services/auth';
 import {
   normalizeMailMessage,
   safeSetEmailHTML,
@@ -1719,7 +1719,7 @@ export class ViewMailbox extends LitElement {
           <div>
             <h3>${user?.email ?? 'uMail Inbox'}</h3>
             <small>
-              UMANG Phone ID: ${user?.phone ?? ''} • Domain: ${user?.domain ?? 'liparola.org'} •
+              UMANG Phone ID: ${user?.phone ?? ''} • Domain: ${user?.domain ?? detectTenantDomain()} •
               Cloudflare Email Routing &amp; Sending (Beta)
             </small>
           </div>

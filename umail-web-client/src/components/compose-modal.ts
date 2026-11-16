@@ -1,7 +1,7 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, state, query } from 'lit/decorators.js';
 import { mailService, type EmailAttachment } from '../services/mail';
-import { authService } from '../services/auth';
+import { authService, detectTenantDomain } from '../services/auth';
 import {
   fileToAttachmentPayload,
   validateAttachmentFile,
@@ -1145,12 +1145,13 @@ export class ComposeModal extends LitElement {
         this._pendingSendPayload.bcc || undefined
       );
 
+      const recipientTo = this._pendingSendPayload.to;
       const provider = res.delivery_provider ?? 'Cloudflare Email Service';
       const isExternal = res.relayed_externally === true;
 
       this.undoState = 'sent';
       this.undoStatusText = isExternal
-        ? `✓ Sent & delivered to ${this._pendingSendPayload.to} via ${provider}`
+        ? `✓ Sent & delivered to ${recipientTo} via ${provider}`
         : `✓ Saved in Sent mailbox (${provider}). External delivery queued.`;
 
       const draftKey = this._getDraftKey();
@@ -1160,7 +1161,7 @@ export class ComposeModal extends LitElement {
       window.dispatchEvent(
         new CustomEvent('email-sent', {
           detail: {
-            to: this._pendingSendPayload.to,
+            to: recipientTo,
             provider,
             relayedExternally: isExternal,
             message: this.undoStatusText,
@@ -1303,7 +1304,7 @@ export class ComposeModal extends LitElement {
             From: <strong>${user?.name ?? 'User'} &lt;${user?.email ?? ''}&gt;</strong>
             <br />
             <small style="color: #6200ee; font-weight: 600;">
-              ✓ Cloudflare Email Service Active • Verified Domain: ${user?.domain ?? 'liparola.org'}
+              ✓ Cloudflare Email Service Active • Verified Domain: ${user?.domain ?? detectTenantDomain()}
             </small>
           </div>
 
@@ -1362,7 +1363,7 @@ export class ComposeModal extends LitElement {
                   <input
                     id="compose-cc"
                     type="text"
-                    placeholder="e.g. colleague@liparola.org, accounts@company.com"
+                    placeholder="e.g. colleague@${user?.domain ?? detectTenantDomain()}, accounts@company.com"
                     .value=${this.cc}
                     ?disabled=${this.sending}
                     @input=${(e: Event) =>
@@ -1389,7 +1390,7 @@ export class ComposeModal extends LitElement {
                   <input
                     id="compose-bcc"
                     type="text"
-                    placeholder="e.g. archive@liparola.org, legal@audit.com"
+                    placeholder="e.g. archive@${user?.domain ?? detectTenantDomain()}, legal@audit.com"
                     .value=${this.bcc}
                     ?disabled=${this.sending}
                     @input=${(e: Event) =>

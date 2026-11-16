@@ -55,6 +55,10 @@ export class ViewDomainInfo extends LitElement {
   render() {
     const user = authService.getUser();
     const domain = user?.domain ?? detectTenantDomain();
+    const dkimValue =
+      domain === 'karabomilling.co.ls'
+        ? 'v=DKIM1; k=ed25519; p=NUIXvIJgMHvwvtkKJU84vEECVoFzZ6LxK23GbJOKN4Y='
+        : 'v=DKIM1; k=ed25519; p=+ipxMN162mE/a8HtWdonthL/QqViSXNOkjw6GWQ2JpI=';
 
     return html`
       <div class="card">
@@ -88,8 +92,14 @@ export class ViewDomainInfo extends LitElement {
             <tr>
               <td><strong>MX</strong></td>
               <td><code>@</code></td>
-              <td><code>10 route1.mx.cloudflare.net</code></td>
+              <td><code>70 route1.mx.cloudflare.net / 52 route2.mx.cloudflare.net / 56 route3.mx.cloudflare.net</code></td>
               <td>Cloudflare Email Routing Inbound Port 25 Catch-All</td>
+            </tr>
+            <tr>
+              <td><strong>MX</strong></td>
+              <td><code>cf-bounce</code></td>
+              <td><code>70 route1.mx.cloudflare.net / 52 route2.mx.cloudflare.net / 56 route3.mx.cloudflare.net</code></td>
+              <td>Cloudflare Email Sending Outbound Bounce Receiver</td>
             </tr>
             <tr>
               <td><strong>TXT</strong></td>
@@ -100,7 +110,7 @@ export class ViewDomainInfo extends LitElement {
             <tr>
               <td><strong>TXT</strong></td>
               <td><code>kaposong._domainkey</code></td>
-              <td><code>v=DKIM1; k=ed25519; p=hJQosMmIpddr923JaG8n2p3rT7vW9yB2eF5hJ8kL1mN=</code></td>
+              <td><code>${dkimValue}</code></td>
               <td>Stalwart Cryptographic DKIM Public Key</td>
             </tr>
             <tr>

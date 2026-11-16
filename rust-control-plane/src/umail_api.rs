@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::{
     arms_webhook::dispatch_tenant_event,
-    auth::{verify_umang_jwt, UmangJwtClaims},
+    auth::{is_token_revoked, verify_umang_jwt, UmangJwtClaims},
     smtp_injector::{
         build_multipart_mime, dispatch_outbound_email, parse_recipient_list, AttachmentPayload,
     },
@@ -68,9 +68,9 @@ pub struct PatchMessagePayload {
     pub folder: Option<String>,
 }
 
-fn extract_jwt_user(
+async fn extract_jwt_user(
+    state: &AppState,
     headers: &HeaderMap,
-    secret: &str,
 ) -> Result<UmangJwtClaims, (StatusCode, Json<serde_json::Value>)> {
     let token = headers
         .get("Authorization")
@@ -83,12 +83,48 @@ fn extract_jwt_user(
             )
         })?;
 
-    verify_umang_jwt(token, secret).ok_or_else(|| {
+    let mut claims = verify_umang_jwt(token, &state.jwt_secret).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Invalid or expired UMANG session token" })),
         )
-    })
+    })?;
+
+    if is_token_revoked(&state.db, token, &claims.jti).await {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Session token has been revoked" })),
+        ));
+    }
+
+    // If token was minted directly by UMANG Core OIDC (`tnt_ka_posong`), map to local tenant & mailbox
+    if claims.client_id == state.umang_tenant_id
+        || claims.client_id == state.umang_client_id
+        || claims.client_id.is_empty()
+        || claims.email.is_empty()
+    {
+        if let Ok(Some(row)) = sqlx::query(
+            r#"SELECT m.email, m.tenant_id, m.domain_name, m.display_name
+               FROM mailboxes m
+               JOIN tenants t ON t.id = m.tenant_id
+               WHERE (m.email = ? OR m.phone = ?) AND m.status = 'ACTIVE' AND t.status = 'ACTIVE'
+               ORDER BY m.created_at ASC LIMIT 1"#,
+        )
+        .bind(&claims.email)
+        .bind(&claims.phone)
+        .fetch_optional(&state.db)
+        .await
+        {
+            claims.email = row.get("email");
+            claims.client_id = row.get("tenant_id");
+            claims.domain = row.get("domain_name");
+            if claims.name.is_empty() {
+                claims.name = row.get("display_name");
+            }
+        }
+    }
+
+    Ok(claims)
 }
 
 /// GET /api/umail/messages
@@ -97,7 +133,7 @@ pub async fn list_umail_messages(
     headers: HeaderMap,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+    let claims = extract_jwt_user(&state, &headers).await?;
     let folder = query.folder.unwrap_or_else(|| "inbox".to_string());
 
     let rows = if let Some(ref search) = query.q {
@@ -191,7 +227,7 @@ pub async fn get_umail_thread(
     headers: HeaderMap,
     Path(thread_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+    let claims = extract_jwt_user(&state, &headers).await?;
 
     let rows = sqlx::query(
         r#"SELECT id, folder, sender_name, sender_email, recipient_email, subject, preview, body_text, body_html,
@@ -257,7 +293,7 @@ pub async fn send_umail_message(
     headers: HeaderMap,
     Json(payload): Json<SendMailPayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+    let claims = extract_jwt_user(&state, &headers).await?;
 
     let to_emails = parse_recipient_list(&payload.to);
     if to_emails.is_empty() {
@@ -475,7 +511,7 @@ pub async fn patch_umail_message(
     Path(msg_id): Path<String>,
     Json(payload): Json<PatchMessagePayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+    let claims = extract_jwt_user(&state, &headers).await?;
 
     if let Some(read) = payload.is_read {
         let _ = sqlx::query(
@@ -522,7 +558,7 @@ pub async fn empty_umail_trash_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+    let claims = extract_jwt_user(&state, &headers).await?;
 
     let result = sqlx::query("DELETE FROM mail_messages WHERE mailbox_email = ? AND folder = 'trash'")
         .bind(&claims.email)
@@ -556,7 +592,7 @@ pub async fn delete_umail_message(
     headers: HeaderMap,
     Path(msg_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let claims = extract_jwt_user(&headers, &state.jwt_secret)?;
+    let claims = extract_jwt_user(&state, &headers).await?;
 
     let result = sqlx::query("DELETE FROM mail_messages WHERE mailbox_email = ? AND id = ?")
         .bind(&claims.email)
