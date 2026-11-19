@@ -17,7 +17,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UMANG_DIR="/home/aurum/Documents/Projects/Business/Liparola FC/Umang"
+if [[ -z "${UMANG_DIR:-}" ]]; then
+    if [[ -d "${ROOT_DIR}/../Umang" ]]; then
+        UMANG_DIR="$(cd "${ROOT_DIR}/../Umang" && pwd)"
+    else
+        UMANG_DIR="/home/aurum/Documents/Projects/Business/Liparola FC/Umang"
+    fi
+fi
 cd "$ROOT_DIR"
 
 BIN_PATH="$ROOT_DIR/rust-control-plane/target/release/rust-control-plane"
