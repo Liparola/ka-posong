@@ -45,10 +45,11 @@ use crate::{
         patch_umail_message, send_umail_message,
     },
     umang_auth::{
-        delete_mailbox_from_umang_core, logout_handler, normalize_lesotho_phone,
-        request_otp_handler, sso_exchange_handler, sync_all_identities_to_umang_core,
-        sync_domain_to_umang_core, sync_mailbox_to_umang_core, umang_config_handler,
-        umang_sso_proxy_handler, umang_webhook_handler, verify_otp_handler, CachedOtpEntry,
+        delete_mailbox_from_umang_core, linka_backend_proxy_handler, logout_handler,
+        normalize_lesotho_phone, request_otp_handler, sso_exchange_handler,
+        sync_all_identities_to_umang_core, sync_domain_to_umang_core,
+        sync_mailbox_to_umang_core, umang_config_handler, umang_sso_proxy_handler,
+        umang_webhook_handler, verify_otp_handler, CachedOtpEntry,
     },
 };
 
@@ -2066,6 +2067,12 @@ async fn main() {
         .route("/api/auth/verify-otp", post(verify_otp_handler))
         .route("/api/auth/sso-exchange", post(sso_exchange_handler))
         .route("/api/auth/logout", post(logout_handler))
+        .route("/api/auth/signout", post(linka_backend_proxy_handler))
+        .route("/api/data/:table", any(linka_backend_proxy_handler))
+        .route("/api/rpc/:func", any(linka_backend_proxy_handler))
+        .route("/api/workspace/*rest", any(linka_backend_proxy_handler))
+        .route("/api/aetherwa/*rest", any(linka_backend_proxy_handler))
+        .route("/api/internal/*rest", any(linka_backend_proxy_handler))
         .route("/api/v1/webhooks/umang", post(umang_webhook_handler))
         .route("/api/umail/messages", get(list_umail_messages))
         .route("/api/umail/thread/:id", get(get_umail_thread))
@@ -2117,7 +2124,7 @@ async fn main() {
                     );
                     headers.insert(
                         "Access-Control-Allow-Headers",
-                        "Content-Type, Authorization, X-API-Key, X-Tenant-ID, X-Umang-Client-Id, X-Umang-Signature, X-KaPosong-Signature, X-Internal-Token, X-Bridge-Secret, X-Ingress-HMAC-Signature, Accept"
+                        "Content-Type, Authorization, X-API-Key, X-Master-Key, X-Tenant-ID, X-Umang-Client-Id, X-Umang-Signature, X-KaPosong-Signature, X-Internal-Token, X-Internal-Secret, X-Bridge-Secret, X-Ingress-HMAC-Signature, X-Requested-With, Origin, Accept"
                             .parse()
                             .unwrap(),
                     );

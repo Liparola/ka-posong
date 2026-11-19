@@ -38,22 +38,36 @@ pub struct CachedOtpEntry {
     pub delegated_to_umang_core: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RequestOtpPayload {
     pub phone: String,
     pub domain: Option<String>,
     pub channel: Option<String>,
+    pub mode: Option<String>,
+    #[serde(rename = "isRegistration")]
+    pub is_registration: Option<bool>,
+    pub name: Option<String>,
+    #[serde(rename = "organizationName")]
+    pub organization_name: Option<String>,
+    pub role: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct VerifyOtpPayload {
     pub phone: String,
     #[serde(alias = "code")]
     pub otp: String,
     pub domain: Option<String>,
+    pub mode: Option<String>,
+    #[serde(rename = "isRegistration")]
+    pub is_registration: Option<bool>,
+    pub name: Option<String>,
+    #[serde(rename = "organizationName")]
+    pub organization_name: Option<String>,
+    pub role: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SsoExchangePayload {
     pub code: String,
     pub code_verifier: Option<String>,
@@ -61,7 +75,7 @@ pub struct SsoExchangePayload {
     pub domain: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LogoutPayload {
     pub token: Option<String>,
 }
@@ -260,6 +274,155 @@ pub async fn umang_sso_proxy_handler(
     Ok(builder.body(Body::from(resp_bytes)).unwrap_or_else(|_| Response::new(Body::empty())))
 }
 
+pub fn resolve_linka_backend_url() -> String {
+    env::var("LINKA_BACKEND_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3002".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+pub fn is_linka_request(
+    headers: &HeaderMap,
+    domain: Option<&str>,
+    mode: Option<&str>,
+    is_registration: Option<bool>,
+) -> bool {
+    if mode.is_some() || is_registration.is_some() {
+        return true;
+    }
+    if let Some(d) = domain {
+        let lower = d.trim().to_lowercase();
+        if lower == "linka.org.ls"
+            || lower == "linka-lesotho.web.app"
+            || lower == "linka-lesotho.firebaseapp.com"
+            || lower == "linka.ls"
+        {
+            return true;
+        }
+    }
+    for h in ["origin", "referer", "x-tenant-id", "x-umang-client-id"] {
+        if let Some(val) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            let lower = val.to_lowercase();
+            if lower.contains("linka") || lower.contains(":5173") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub async fn proxy_json_to_linka_backend(
+    path: &str,
+    headers: &HeaderMap,
+    body_json: &serde_json::Value,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let target_url = format!("{}{}", resolve_linka_backend_url(), path);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut req_builder = client.post(&target_url).json(body_json);
+    for h in ["authorization", "origin", "referer", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"] {
+        if let Some(val) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            req_builder = req_builder.header(h, val);
+        }
+    }
+
+    let resp = req_builder.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Linka Backend (:3002) unavailable: {}", e) })),
+        )
+    })?;
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_json = resp
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "error": "Invalid JSON response from Linka Backend" }));
+
+    if status.is_success() {
+        Ok(Json(resp_json))
+    } else {
+        Err((status, Json(resp_json)))
+    }
+}
+
+/// Transparently proxies Linka-scoped `/api/{data,rpc,workspace,aetherwa,internal,auth/signout}` routes
+/// arriving on the root Tailscale Funnel (`/api/*` -> `:8443`) to `linka-backend` (`127.0.0.1:3002`).
+pub async fn linka_backend_proxy_handler(
+    req: Request,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    let path = req.uri().path().to_string();
+    let query_part = req
+        .uri()
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
+    let target_url = format!("{}{}{}", resolve_linka_backend_url(), path, query_part);
+
+    let method_str = req.method().as_str().to_string();
+    let req_method = reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
+
+    let incoming_headers = req.headers().clone();
+    let body_bytes = to_bytes(req.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("Invalid request body: {}", e) })),
+            )
+        })?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut proxy_req = client.request(req_method, &target_url).body(body_bytes);
+
+    for header_name in [
+        "content-type",
+        "authorization",
+        "x-api-key",
+        "x-master-key",
+        "x-tenant-id",
+        "x-umang-client-id",
+        "x-internal-token",
+        "x-internal-secret",
+        "origin",
+        "referer",
+        "accept",
+    ] {
+        if let Some(val) = incoming_headers.get(header_name).and_then(|v| v.to_str().ok()) {
+            proxy_req = proxy_req.header(header_name, val);
+        }
+    }
+
+    let upstream = proxy_req.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("Linka Backend unavailable: {}", e) })),
+        )
+    })?;
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json; charset=utf-8")
+        .to_string();
+    let resp_bytes = upstream.bytes().await.unwrap_or_default();
+
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", content_type)
+        .body(Body::from(resp_bytes))
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
 /// Asynchronously synchronizes a ka-posong domain into UMANG Core (`tnt_ka_posong`)
 pub async fn sync_domain_to_umang_core(state: &AppState, domain: &str) {
     let url = format!(
@@ -369,12 +532,32 @@ pub async fn umang_config_handler(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let domain = params
-        .get("domain")
-        .map(|d| d.trim().to_lowercase())
-        .unwrap_or_else(|| "liparola.org".to_string());
-
+    let raw_domain = params.get("domain").map(|d| d.trim().to_lowercase());
     let public_base = resolve_public_umang_base_url(&headers, &state);
+
+    if is_linka_request(&headers, raw_domain.as_deref(), None, None) {
+        let domain = raw_domain.unwrap_or_else(|| "linka.org.ls".to_string());
+        return Json(serde_json::json!({
+            "status": "OK",
+            "umang_standard": "UMANG-SSO-AetherWA-SMS-v2",
+            "umang_tenant_id": "tnt_linka_lesotho",
+            "umang_client_id": "umang_pk_linka_lesotho",
+            "integration_level": "L4_CORE_CONNECTOR",
+            "domain": domain,
+            "sso_authorize_url": format!(
+                "{}/sso/authorize?client_id=umang_pk_linka_lesotho&domain={}",
+                public_base,
+                domain
+            ),
+            "oidc_discovery_url": format!(
+                "{}/api/v1/instances/tnt_linka_lesotho/.well-known/openid-configuration",
+                public_base
+            ),
+            "sdk_script_url": format!("{}/sdk/v1/umang.js", public_base)
+        }));
+    }
+
+    let domain = raw_domain.unwrap_or_else(|| "liparola.org".to_string());
 
     Json(serde_json::json!({
         "status": "OK",
@@ -401,8 +584,19 @@ pub async fn umang_config_handler(
 /// POST /api/auth/request-otp
 pub async fn request_otp_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<RequestOtpPayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if is_linka_request(
+        &headers,
+        payload.domain.as_deref(),
+        payload.mode.as_deref(),
+        payload.is_registration,
+    ) {
+        let body_val = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+        return proxy_json_to_linka_backend("/api/auth/request-otp", &headers, &body_val).await;
+    }
+
     let phone = normalize_lesotho_phone(&payload.phone).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -444,6 +638,13 @@ pub async fn request_otp_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
+
+    // If no domain was specified (Linka client calling /api/auth/request-otp without a uMail domain)
+    // and no uMail mailbox exists for this phone, delegate to Linka Backend (:3002)
+    if row.is_none() && payload.domain.is_none() {
+        let body_val = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+        return proxy_json_to_linka_backend("/api/auth/request-otp", &headers, &body_val).await;
+    }
 
     let row = row.ok_or_else(|| {
         (
@@ -661,14 +862,45 @@ pub async fn request_otp_handler(
 /// POST /api/auth/verify-otp
 pub async fn verify_otp_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<VerifyOtpPayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if is_linka_request(
+        &headers,
+        payload.domain.as_deref(),
+        payload.mode.as_deref(),
+        payload.is_registration,
+    ) {
+        let body_val = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+        return proxy_json_to_linka_backend("/api/auth/verify-otp", &headers, &body_val).await;
+    }
+
     let phone = normalize_lesotho_phone(&payload.phone).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "Invalid phone number format." })),
         )
     })?;
+
+    let cached_snapshot = {
+        let cache = state.otp_cache.read().await;
+        cache.get(&phone).cloned()
+    };
+
+    // If no uMail OTP was cached locally for this phone and no uMail domain was specified,
+    // delegate verification to Linka Backend (:3002)
+    if cached_snapshot.is_none() && payload.domain.is_none() {
+        let has_mbx: Option<(String,)> = sqlx::query_as("SELECT email FROM mailboxes WHERE phone = ? LIMIT 1")
+            .bind(&phone)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+        if has_mbx.is_none() {
+            let body_val = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+            return proxy_json_to_linka_backend("/api/auth/verify-otp", &headers, &body_val).await;
+        }
+    }
 
     let submitted_otp = payload.otp.trim();
     if submitted_otp.len() != 6 || !submitted_otp.chars().all(|c| c.is_ascii_digit()) {
@@ -679,10 +911,6 @@ pub async fn verify_otp_handler(
     }
 
     let now = chrono::Utc::now().timestamp();
-    let cached_snapshot = {
-        let cache = state.otp_cache.read().await;
-        cache.get(&phone).cloned()
-    };
 
     if !state.allow_dev_otp_preview {
         if let Some(ref entry) = cached_snapshot {
@@ -950,8 +1178,23 @@ pub async fn verify_otp_handler(
 /// Exchanges an OAuth 2.0 `authorization_code` + PKCE `code_verifier` with UMANG Core Engine
 pub async fn sso_exchange_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<SsoExchangePayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let redirect_is_linka = payload
+        .redirect_uri
+        .as_deref()
+        .map(|u| {
+            let l = u.to_lowercase();
+            l.contains("linka") || l.contains(":5173")
+        })
+        .unwrap_or(false);
+
+    if redirect_is_linka || is_linka_request(&headers, payload.domain.as_deref(), None, None) {
+        let body_val = serde_json::to_value(&payload).unwrap_or_else(|_| serde_json::json!({}));
+        return proxy_json_to_linka_backend("/api/auth/sso-exchange", &headers, &body_val).await;
+    }
+
     let token_url = format!(
         "{}/api/v1/sso/token",
         state.umang_core_url.trim_end_matches('/')
@@ -1127,6 +1370,15 @@ pub async fn logout_handler(
             .timeout(std::time::Duration::from_secs(4))
             .header("X-API-Key", &state.umang_api_key)
             .header("X-Tenant-ID", &state.umang_tenant_id)
+            .json(&serde_json::json!({ "token": token }))
+            .send()
+            .await;
+
+        let linka_revoke_url = format!("{}/api/auth/logout", resolve_linka_backend_url());
+        let _ = reqwest::Client::new()
+            .post(&linka_revoke_url)
+            .timeout(std::time::Duration::from_secs(4))
+            .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({ "token": token }))
             .send()
             .await;
